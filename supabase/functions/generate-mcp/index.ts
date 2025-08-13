@@ -6,6 +6,18 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Global configuration for optimization
+const GLOBAL_TIMEOUT = 30000; // 30 seconds total function timeout
+const HTTP_TIMEOUT = 3000; // 3 seconds per HTTP request
+const MAX_PAGES = 5; // Maximum pages to process
+const MAX_PARALLEL = 2; // Maximum parallel requests
+const MAX_FILE_SIZE = 50 * 1024; // 50KB max file size
+const OPENAI_TIMEOUT = 5000; // 5 seconds for OpenAI enhancement
+
+// Global timer tracking
+let startTime: number;
+let urlCache = new Set<string>();
+
 interface Endpoint {
   path: string;
   method: string;
@@ -81,7 +93,18 @@ function isSafeUrl(url: string): boolean {
   }
 }
 
-async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 20000): Promise<Response> {
+// Helper function to check if we're running out of time
+function isTimeoutApproaching(): boolean {
+  const elapsed = Date.now() - startTime;
+  return elapsed > (GLOBAL_TIMEOUT - 5000); // 5 seconds buffer
+}
+
+// Optimized fetch with shorter timeout and size check
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = HTTP_TIMEOUT): Promise<Response> {
+  if (isTimeoutApproaching()) {
+    throw new Error('Global timeout approaching, aborting request');
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   
@@ -95,6 +118,13 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout 
       },
     });
     clearTimeout(timeoutId);
+
+    // Check content size before downloading
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && parseInt(contentLength) > MAX_FILE_SIZE) {
+      throw new Error(`File too large: ${contentLength} bytes (max: ${MAX_FILE_SIZE})`);
+    }
+
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
@@ -102,234 +132,191 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout 
   }
 }
 
-// Main crawler function with unlimited depth
+// Optimized URL checking
+function shouldSkipUrl(url: string): boolean {
+  if (urlCache.has(url)) return true;
+  
+  const lowerUrl = url.toLowerCase();
+  
+  // Skip non-HTML files
+  const skipExtensions = ['.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.woff', '.woff2', '.ttf', '.pdf'];
+  if (skipExtensions.some(ext => lowerUrl.endsWith(ext))) return true;
+  
+  // Skip large file indicators
+  if (lowerUrl.includes('download') || lowerUrl.includes('static/') || lowerUrl.includes('assets/')) return true;
+  
+  return false;
+}
+
+// Optimized crawler function with strict limits and timeout control
 async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ endpoints: Endpoint[], sourceUrls: string[], logs: string[] }> {
   const logs: string[] = [];
   const visitedUrls = new Set<string>();
   const sourceUrls: string[] = [];
-  const urlsToProcess = new Set<string>([url]);
+  const urlsToProcess = [url]; // Use array for better control
   let allEndpoints: Endpoint[] = [];
-  const maxPages = options.maxPages || 50; // Safety limit to prevent infinite crawling
+  const maxPages = Math.min(options.maxPages || MAX_PAGES, MAX_PAGES);
   let processedPages = 0;
 
-  logs.push(`[Crawler] Starting unlimited depth crawl of: ${url}`);
-  logs.push(`[Crawler] Max pages limit: ${maxPages}`);
+  logs.push(`[Crawler] Starting optimized crawl of: ${url}`);
+  logs.push(`[Crawler] Max pages limit: ${maxPages}, Global timeout: ${GLOBAL_TIMEOUT}ms`);
 
   const baseHost = new URL(url).hostname;
+  urlCache.clear(); // Reset cache for each crawl
 
-  while (urlsToProcess.size > 0 && processedPages < maxPages) {
-    const currentUrl = Array.from(urlsToProcess)[0];
-    urlsToProcess.delete(currentUrl);
+  // Priority 1: Try to find JSON/YAML specs directly first
+  const directSpecUrls = [
+    new URL('/openapi.json', url).href,
+    new URL('/swagger.json', url).href,
+    new URL('/api-docs/swagger.json', url).href,
+    new URL('/docs/openapi.json', url).href,
+    new URL('/api/openapi.json', url).href,
+  ];
 
-    if (visitedUrls.has(currentUrl)) continue;
-
-    if (!isValidUrl(currentUrl) || !isSafeUrl(currentUrl)) {
-      logs.push(`[Crawler] Skipping invalid/unsafe URL: ${currentUrl}`);
-      continue;
-    }
-
-    // Only crawl within the same domain for security
-    const currentHost = new URL(currentUrl).hostname;
-    if (currentHost !== baseHost) {
-      logs.push(`[Crawler] Skipping external domain: ${currentUrl}`);
-      continue;
-    }
-
-    try {
-      logs.push(`[Crawler] Processing page ${processedPages + 1}/${maxPages}: ${currentUrl}`);
-      
-      const response = await fetchWithTimeout(currentUrl, {}, 15000);
-      const content = await response.text();
-      const contentType = response.headers.get('content-type') || '';
-      
-      visitedUrls.add(currentUrl);
-      sourceUrls.push(currentUrl);
-      processedPages++;
-      
-      logs.push(`[Crawler] Fetched: ${response.status}, Content: ${content.length} chars, Type: ${contentType}`);
-
-      // Check if this is a JSON/YAML spec file
-      if (contentType.includes('application/json') || contentType.includes('application/yaml') || 
-          currentUrl.includes('.json') || currentUrl.includes('.yaml') || currentUrl.includes('.yml')) {
-        logs.push(`[Crawler] Processing as spec file: ${currentUrl}`);
-        const endpoints = await parseApiSpec(currentUrl, content, logs);
-        allEndpoints = allEndpoints.concat(endpoints);
-        logs.push(`[Crawler] Extracted ${endpoints.length} endpoints from spec file`);
-        continue;
-      }
-
-    // Enhanced Swagger UI detection and configuration extraction
-    const isSwaggerUI = content.includes('swagger-ui') || content.includes('SwaggerUIBundle') || 
-                       content.includes('swagger.json') || content.includes('openapi.json') ||
-                       content.includes('SwaggerUIStandalonePreset') || 
-                       content.includes('"swagger"') || content.includes('"openapi"');
-    
-    if (isSwaggerUI) {
-      logs.push(`[Crawler] Detected Swagger UI page: ${currentUrl}`);
-      
-      // Enhanced Swagger config extraction
-      const swaggerSpecs = extractSwaggerUIConfig(content, currentUrl);
-      logs.push(`[Crawler] Found ${swaggerSpecs.length} Swagger specs from UI config`);
-      
-      // If no specs found in config, try common patterns
-      if (swaggerSpecs.length === 0) {
-        const commonSwaggerPaths = [
-          new URL('/openapi.json', currentUrl).href,
-          new URL('/swagger.json', currentUrl).href,
-          new URL('/docs/openapi.json', currentUrl).href,
-          new URL('/api/openapi.json', currentUrl).href,
-          new URL('/api-docs/swagger.json', currentUrl).href,
-          new URL('./openapi.json', currentUrl).href,
-          new URL('./swagger.json', currentUrl).href
-        ];
-        
-        for (const specPath of commonSwaggerPaths) {
-          try {
-            const specResponse = await fetchWithTimeout(specPath, { method: 'HEAD' }, 5000);
-            if (specResponse.ok) {
-              swaggerSpecs.push(specPath);
-              logs.push(`[Crawler] Found accessible spec at: ${specPath}`);
-            }
-          } catch (e) {
-            // Ignore errors for HEAD requests
+  logs.push(`[Crawler] Phase 1: Checking direct spec URLs`);
+  const directSpecPromises = directSpecUrls
+    .filter(specUrl => new URL(specUrl).hostname === baseHost)
+    .slice(0, 3) // Limit to first 3
+    .map(async (specUrl) => {
+      try {
+        const response = await fetchWithTimeout(specUrl);
+        if (response.ok) {
+          const content = await response.text();
+          const endpoints = await parseApiSpec(specUrl, content, logs);
+          if (endpoints.length > 0) {
+            logs.push(`[Crawler] Found ${endpoints.length} endpoints from direct spec: ${specUrl}`);
+            sourceUrls.push(specUrl);
+            return endpoints;
           }
         }
+      } catch (error) {
+        // Continue silently
       }
-      
-      for (const specUrl of swaggerSpecs) {
-        if (!visitedUrls.has(specUrl) && new URL(specUrl).hostname === baseHost) {
-          urlsToProcess.add(specUrl);
-        }
-      }
-    }
+      return [];
+    });
 
-      // Find all potential API documentation links
-      const documentationLinks = findDocumentationLinks(content, currentUrl);
-      logs.push(`[Crawler] Found ${documentationLinks.length} documentation links on ${currentUrl}`);
-
-      // Add documentation links to processing queue
-      for (const link of documentationLinks) {
-        if (!visitedUrls.has(link) && new URL(link).hostname === baseHost) {
-          urlsToProcess.add(link);
-        }
-      }
-
-      // Look for API spec files using improved detection
-      const specUrls = await findApiSpecs(currentUrl, content);
-      logs.push(`[Crawler] Found ${specUrls.length} potential spec URLs on ${currentUrl}`);
-
-      // Add spec URLs to processing queue
-      for (const specUrl of specUrls) {
-        if (!visitedUrls.has(specUrl) && !isNonSpecUrl(specUrl) && new URL(specUrl).hostname === baseHost) {
-          urlsToProcess.add(specUrl);
-        }
-      }
-
-      // Enhanced HTML parsing for current page
-      const htmlEndpoints = parseHtmlForEndpoints(content, currentUrl);
-      if (htmlEndpoints.length > 0) {
-        allEndpoints = allEndpoints.concat(htmlEndpoints);
-        logs.push(`[Crawler] Extracted ${htmlEndpoints.length} endpoints from HTML on ${currentUrl}`);
-      }
-
-      // Small delay to respect rate limiting
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-    } catch (error) {
-      logs.push(`[Crawler] Error processing ${currentUrl}: ${error.message}`);
-      continue;
+  const directResults = await Promise.allSettled(directSpecPromises);
+  for (const result of directResults) {
+    if (result.status === 'fulfilled') {
+      allEndpoints = allEndpoints.concat(result.value);
     }
   }
 
-      // If we found very few endpoints, try multiple enhancement strategies
-      if (allEndpoints.length < 10 && options.useFirecrawl !== false) {
-        logs.push(`[Crawler] Found few endpoints (${allEndpoints.length}), trying enhanced scraping strategies`);
+  // If we found enough endpoints from direct specs, return early
+  if (allEndpoints.length >= 5) {
+    logs.push(`[Crawler] Found sufficient endpoints (${allEndpoints.length}) from direct specs, skipping HTML crawling`);
+    return {
+      endpoints: allEndpoints,
+      sourceUrls,
+      logs
+    };
+  }
+
+  // Phase 2: Crawl main pages with strict limits
+  logs.push(`[Crawler] Phase 2: HTML crawling with ${maxPages} page limit`);
+  
+  while (urlsToProcess.length > 0 && processedPages < maxPages && !isTimeoutApproaching()) {
+    // Process URLs in batches for better control
+    const batch = urlsToProcess.splice(0, MAX_PARALLEL);
+    
+    const batchPromises = batch.map(async (currentUrl) => {
+      if (visitedUrls.has(currentUrl) || shouldSkipUrl(currentUrl)) {
+        return { endpoints: [], newUrls: [] };
+      }
+
+      if (!isValidUrl(currentUrl) || !isSafeUrl(currentUrl)) {
+        logs.push(`[Crawler] Skipping invalid/unsafe URL: ${currentUrl}`);
+        return { endpoints: [], newUrls: [] };
+      }
+
+      // Only crawl within the same domain
+      const currentHost = new URL(currentUrl).hostname;
+      if (currentHost !== baseHost) {
+        return { endpoints: [], newUrls: [] };
+      }
+
+      try {
+        urlCache.add(currentUrl);
+        visitedUrls.add(currentUrl);
         
-        // Strategy 1: Try Firecrawl for comprehensive scraping
-        try {
-          const firecrawlEndpoints = await crawlWithFirecrawl(url, logs);
-          allEndpoints = allEndpoints.concat(firecrawlEndpoints);
-          logs.push(`[Firecrawl] Added ${firecrawlEndpoints.length} endpoints`);
-        } catch (error) {
-          logs.push(`[Firecrawl] Error: ${error.message}`);
-        }
+        const response = await fetchWithTimeout(currentUrl);
+        const content = await response.text();
+        const contentType = response.headers.get('content-type') || '';
         
-        // Strategy 2: Deep HTML analysis of the main page
-        if (allEndpoints.length < 10) {
-          logs.push('[Crawler] Performing deep HTML analysis of main documentation page');
-          try {
-            const mainPageResponse = await fetchWithTimeout(url);
-            if (mainPageResponse.ok) {
-              const mainContent = await mainPageResponse.text();
-              
-              // Enhanced HTML parsing with more aggressive patterns
-              const htmlEndpoints = parseHtmlForEndpoints(mainContent, url);
-              
-              // Filter out duplicates
-              const newEndpoints = htmlEndpoints.filter(ep => 
-                !allEndpoints.some(existing => existing.path === ep.path && existing.method === ep.method)
-              );
-              
-              allEndpoints = allEndpoints.concat(newEndpoints);
-              logs.push(`[Crawler] Deep HTML analysis found ${newEndpoints.length} additional endpoints`);
-            }
-          } catch (error) {
-            logs.push(`[Crawler] Deep HTML analysis failed: ${error.message}`);
-          }
-        }
-        
-        // Strategy 3: Try to access swagger.json with different headers and methods
-        if (allEndpoints.length < 10) {
-          logs.push('[Crawler] Trying alternative access methods for API specs');
-          const alternativeHeaders = [
-            { 'Accept': 'application/json' },
-            { 'Accept': 'text/plain' },
-            { 'User-Agent': 'Mozilla/5.0 (compatible; API-Crawler/1.0)' },
-            { 'Accept': 'application/json', 'User-Agent': 'Swagger-UI' },
-            { 'Accept': '*/*', 'User-Agent': 'curl/7.68.0' }
-          ];
-          
-          const specPaths = ['/swagger.json', '/openapi.json', '/api-docs/swagger.json', '/docs/swagger.json'];
-          
-          for (const headers of alternativeHeaders) {
-            for (const specPath of specPaths) {
-              try {
-                const specUrl = new URL(specPath, new URL(url).origin).href;
-                const specResponse = await fetchWithTimeout(specUrl, { headers });
-                if (specResponse.ok) {
-                  const content = await specResponse.text();
-                  if (content.trim().startsWith('{') || content.trim().startsWith('openapi:')) {
-                    try {
-                      const spec = JSON.parse(content);
-                      if (spec.paths && Object.keys(spec.paths).length > 0) {
-                        const specEndpoints = parseOpenApiSpec(spec, new URL(url).origin);
-                        allEndpoints = allEndpoints.concat(specEndpoints);
-                        logs.push(`[Crawler] Alternative access found ${specEndpoints.length} endpoints from ${specUrl}`);
-                        break;
-                      }
-                    } catch (e) {
-                      // Try YAML parsing or continue
-                    }
+        sourceUrls.push(currentUrl);
+        logs.push(`[Crawler] Processed: ${currentUrl} (${content.length} chars)`);
+
+        const pageEndpoints: Endpoint[] = [];
+        const newUrls: string[] = [];
+
+        // Check if this is a spec file
+        if (contentType.includes('application/json') || contentType.includes('application/yaml') || 
+            currentUrl.includes('.json') || currentUrl.includes('.yaml') || currentUrl.includes('.yml')) {
+          const endpoints = await parseApiSpec(currentUrl, content, logs);
+          pageEndpoints.push(...endpoints);
+          logs.push(`[Crawler] Spec file: ${endpoints.length} endpoints`);
+        } else {
+          // HTML processing - simplified and faster
+          const htmlEndpoints = parseHtmlForEndpoints(content, currentUrl);
+          pageEndpoints.push(...htmlEndpoints);
+
+          // Only find more URLs if we haven't hit the page limit
+          if (processedPages < maxPages - 1) {
+            // Simplified link extraction - only look for obvious API docs
+            const apiKeywords = ['swagger', 'openapi', 'api-docs', '/api/', '/docs/'];
+            const simpleLinks = content.match(/href=["']([^"']+)["']/gi) || [];
+            
+            for (const linkMatch of simpleLinks.slice(0, 10)) { // Limit to first 10 links
+              const href = linkMatch.match(/href=["']([^"']+)["']/)?.[1];
+              if (href && apiKeywords.some(keyword => href.toLowerCase().includes(keyword))) {
+                try {
+                  const fullUrl = new URL(href, currentUrl).href;
+                  if (new URL(fullUrl).hostname === baseHost && !visitedUrls.has(fullUrl)) {
+                    newUrls.push(fullUrl);
                   }
+                } catch (e) {
+                  // Invalid URL, skip
                 }
-              } catch (error) {
-                // Continue with next combination
               }
             }
-            if (allEndpoints.length >= 10) break;
           }
         }
+
+        return { endpoints: pageEndpoints, newUrls };
+
+      } catch (error) {
+        logs.push(`[Crawler] Error processing ${currentUrl}: ${error.message}`);
+        return { endpoints: [], newUrls: [] };
       }
-      
-      // Try common API paths as last resort if still no endpoints found
-  if (allEndpoints.length === 0) {
-    logs.push(`[Crawler] No endpoints found, trying common API paths as last resort`);
+    });
+
+    const batchResults = await Promise.allSettled(batchPromises);
+    
+    for (const result of batchResults) {
+      if (result.status === 'fulfilled') {
+        allEndpoints = allEndpoints.concat(result.value.endpoints);
+        // Add new URLs to process (but limit total)
+        urlsToProcess.push(...result.value.newUrls.slice(0, 2));
+      }
+    }
+    
+    processedPages += batch.length;
+    
+    // Remove duplicates from urlsToProcess
+    const uniqueUrls = [...new Set(urlsToProcess.filter(url => !visitedUrls.has(url)))];
+    urlsToProcess.length = 0;
+    urlsToProcess.push(...uniqueUrls.slice(0, maxPages - processedPages));
+  }
+
+  // Phase 3: Basic fallback if no endpoints found
+  if (allEndpoints.length === 0 && !isTimeoutApproaching()) {
+    logs.push(`[Crawler] Phase 3: Basic fallback strategy`);
     const commonEndpoints = await tryCommonApiPaths(url, logs);
     allEndpoints = allEndpoints.concat(commonEndpoints);
   }
 
-  logs.push(`[Crawler] Crawling completed. Processed ${processedPages} pages, found ${allEndpoints.length} total endpoints`);
-  logs.push(`[Crawler] Visited URLs: ${Array.from(visitedUrls).join(', ')}`);
+  logs.push(`[Crawler] Completed. Processed ${processedPages} pages, found ${allEndpoints.length} endpoints`);
+  logs.push(`[Crawler] Total time: ${Date.now() - startTime}ms`);
   
   return {
     endpoints: allEndpoints,
@@ -1158,9 +1145,12 @@ serve(async (req) => {
   }
 
   try {
+    // Initialize global timer
+    startTime = Date.now();
+    
     const { url, openaiApiKey, options = {} } = await req.json();
-
-    console.log('[McpGenerator] Starting generation for:', url);
+    console.log('[McpGenerator] Starting optimized generation for:', url);
+    console.log('[McpGenerator] Global timeout:', GLOBAL_TIMEOUT, 'ms');
 
     if (!url || !openaiApiKey) {
       return new Response(
@@ -1175,16 +1165,46 @@ serve(async (req) => {
       );
     }
 
-    // Crawl and parse API documentation
-    const { endpoints, sourceUrls, logs } = await crawlApiDocumentation(url, options);
+    // Set up global timeout handler for graceful shutdown
+    const globalTimeoutPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        resolve({
+          isTimeout: true,
+          endpoints: [],
+          sourceUrls: [],
+          logs: ['[Global] Function timeout reached, returning partial results']
+        });
+      }, GLOBAL_TIMEOUT - 1000); // 1 second buffer
+    });
+
+    // Race between crawling and global timeout
+    const crawlPromise = crawlApiDocumentation(url, {
+      ...options,
+      maxPages: Math.min(options.maxPages || MAX_PAGES, MAX_PAGES)
+    });
+
+    const result = await Promise.race([crawlPromise, globalTimeoutPromise]);
+    
+    let { endpoints, sourceUrls, logs } = result as any;
+    const isTimeout = result.isTimeout;
+
+    if (isTimeout) {
+      logs.push(`[Global] Function timed out after ${GLOBAL_TIMEOUT}ms`);
+    }
     
     if (endpoints.length === 0) {
       return new Response(
         JSON.stringify({ 
           success: false, 
-          error: 'Nenhum endpoint encontrado na documentação. Verifique se a URL contém documentação de API válida ou tente uma URL diferente.',
+          error: isTimeout ? 
+            'Timeout atingido durante o processamento. A documentação pode ser muito complexa.' :
+            'Nenhum endpoint encontrado na documentação. Verifique se a URL contém documentação de API válida.',
           logs,
-          suggestions: [
+          suggestions: isTimeout ? [
+            'Tente uma URL mais específica (ex: /openapi.json)',
+            'Verifique se há arquivos de spec JSON/YAML diretos',
+            'Use uma documentação com menos páginas'
+          ] : [
             'Verifique se a URL aponta para documentação de API',
             'Tente URLs como /api-docs, /swagger, /openapi.json',
             'Certifique-se de que a documentação está publicamente acessível'
@@ -1197,12 +1217,31 @@ serve(async (req) => {
       );
     }
 
-    // Enhance with OpenAI
-    const enhancedEndpoints = await enhanceWithOpenAI(endpoints, openaiApiKey, logs);
+    // Only enhance with OpenAI if we have time left
+    let enhancedEndpoints = endpoints;
+    if (!isTimeoutApproaching() && !isTimeout) {
+      try {
+        const startEnhancement = Date.now();
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('OpenAI timeout')), OPENAI_TIMEOUT);
+        });
+        
+        const enhancePromise = enhanceWithOpenAI(endpoints, openaiApiKey, logs);
+        enhancedEndpoints = await Promise.race([enhancePromise, timeoutPromise]);
+        
+        logs.push(`[OpenAI] Enhancement completed in ${Date.now() - startEnhancement}ms`);
+      } catch (error) {
+        logs.push(`[OpenAI] Enhancement skipped due to timeout or error: ${error.message}`);
+      }
+    } else {
+      logs.push('[OpenAI] Enhancement skipped due to time constraints');
+    }
     
     // Generate MCP
     const mcpSpec = generateMcp(enhancedEndpoints, sourceUrls);
     
+    const totalTime = Date.now() - startTime;
+    logs.push(`[McpGenerator] Completed in ${totalTime}ms`);
     console.log('[McpGenerator] Successfully generated MCP with', enhancedEndpoints.length, 'tools');
 
     return new Response(
@@ -1211,6 +1250,11 @@ serve(async (req) => {
         data: mcpSpec,
         endpoints: enhancedEndpoints,
         logs,
+        metadata: {
+          processingTime: totalTime,
+          timeoutReached: isTimeout,
+          endpointsFound: enhancedEndpoints.length
+        }
       }),
       { 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -1218,12 +1262,17 @@ serve(async (req) => {
     );
 
   } catch (error) {
-    console.error('[McpGenerator] Error:', error);
+    const totalTime = Date.now() - startTime;
+    console.error('[McpGenerator] Error after', totalTime, 'ms:', error);
     
     return new Response(
       JSON.stringify({ 
         success: false, 
         error: error.message || 'Erro interno do servidor',
+        metadata: {
+          processingTime: totalTime,
+          errorType: error.name || 'Unknown'
+        }
       }),
       { 
         status: 500, 
