@@ -252,6 +252,21 @@ export const McpForm = ({ onGenerate }: McpFormProps) => {
               />
             </div>
 
+            <div className="space-y-2">
+              <Label htmlFor="advanced-crawling">Crawling Avançado</Label>
+              <div className="flex items-center space-x-2">
+                <Switch
+                  id="use-firecrawl"
+                  checked={includeWorkflow}
+                  onCheckedChange={setIncludeWorkflow}
+                />
+                <Label htmlFor="use-firecrawl">Usar Firecrawl para scraping robusto</Label>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Ativa scraping avançado com IA para documentações complexas (requer API key do Firecrawl)
+              </p>
+            </div>
+
             <Button
               type="submit"
               variant="gradient"

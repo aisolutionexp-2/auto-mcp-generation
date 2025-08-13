@@ -158,21 +158,50 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
         continue;
       }
 
-      // Detect if this is a Swagger UI page
-      const isSwaggerUI = content.includes('swagger-ui') || content.includes('SwaggerUIBundle') || 
-                         content.includes('swagger.json') || content.includes('openapi.json');
+    // Enhanced Swagger UI detection and configuration extraction
+    const isSwaggerUI = content.includes('swagger-ui') || content.includes('SwaggerUIBundle') || 
+                       content.includes('swagger.json') || content.includes('openapi.json') ||
+                       content.includes('SwaggerUIStandalonePreset') || 
+                       content.includes('"swagger"') || content.includes('"openapi"');
+    
+    if (isSwaggerUI) {
+      logs.push(`[Crawler] Detected Swagger UI page: ${currentUrl}`);
       
-      if (isSwaggerUI) {
-        logs.push(`[Crawler] Detected Swagger UI page: ${currentUrl}`);
-        const swaggerSpecs = extractSwaggerUIConfig(content, currentUrl);
-        logs.push(`[Crawler] Found ${swaggerSpecs.length} Swagger specs from UI config`);
+      // Enhanced Swagger config extraction
+      const swaggerSpecs = extractSwaggerUIConfig(content, currentUrl);
+      logs.push(`[Crawler] Found ${swaggerSpecs.length} Swagger specs from UI config`);
+      
+      // If no specs found in config, try common patterns
+      if (swaggerSpecs.length === 0) {
+        const commonSwaggerPaths = [
+          new URL('/openapi.json', currentUrl).href,
+          new URL('/swagger.json', currentUrl).href,
+          new URL('/docs/openapi.json', currentUrl).href,
+          new URL('/api/openapi.json', currentUrl).href,
+          new URL('/api-docs/swagger.json', currentUrl).href,
+          new URL('./openapi.json', currentUrl).href,
+          new URL('./swagger.json', currentUrl).href
+        ];
         
-        for (const specUrl of swaggerSpecs) {
-          if (!visitedUrls.has(specUrl) && new URL(specUrl).hostname === baseHost) {
-            urlsToProcess.add(specUrl);
+        for (const specPath of commonSwaggerPaths) {
+          try {
+            const specResponse = await fetchWithTimeout(specPath, { method: 'HEAD' }, 5000);
+            if (specResponse.ok) {
+              swaggerSpecs.push(specPath);
+              logs.push(`[Crawler] Found accessible spec at: ${specPath}`);
+            }
+          } catch (e) {
+            // Ignore errors for HEAD requests
           }
         }
       }
+      
+      for (const specUrl of swaggerSpecs) {
+        if (!visitedUrls.has(specUrl) && new URL(specUrl).hostname === baseHost) {
+          urlsToProcess.add(specUrl);
+        }
+      }
+    }
 
       // Find all potential API documentation links
       const documentationLinks = findDocumentationLinks(content, currentUrl);
@@ -212,7 +241,14 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
     }
   }
 
-  // Try common API paths as last resort if no endpoints found
+      // Try Firecrawl for comprehensive documentation scraping
+      if (allEndpoints.length < 5) { // Only use Firecrawl if we haven't found many endpoints
+        logs.push(`[Crawler] Found few endpoints (${allEndpoints.length}), trying Firecrawl for comprehensive scraping`);
+        const firecrawlEndpoints = await crawlWithFirecrawl(url, logs);
+        allEndpoints = allEndpoints.concat(firecrawlEndpoints);
+      }
+      
+      // Try common API paths as last resort if still no endpoints found
   if (allEndpoints.length === 0) {
     logs.push(`[Crawler] No endpoints found, trying common API paths as last resort`);
     const commonEndpoints = await tryCommonApiPaths(url, logs);
@@ -284,31 +320,65 @@ function findDocumentationLinks(content: string, baseUrl: string): string[] {
   return links;
 }
 
-// Extract Swagger UI config from JavaScript
+// Enhanced Swagger UI config extraction
 function extractSwaggerUIConfig(content: string, baseUrl: string): string[] {
   const specs: string[] = [];
   const base = new URL(baseUrl);
   
-  // Look for Swagger UI configuration
+  // Enhanced patterns for Swagger UI configuration
   const swaggerConfigPatterns = [
+    // Standard Swagger UI patterns
     /url:\s*["']([^"']+)["']/gi,
     /spec:\s*["']([^"']+)["']/gi,
     /SwaggerUIBundle\(\s*{\s*url:\s*["']([^"']+)["']/gi,
     /"spec":\s*"([^"]+)"/gi,
-    /'spec':\s*'([^']+)'/gi
+    /'spec':\s*'([^']+)'/gi,
+    // More specific patterns
+    /window\.ui\s*=\s*SwaggerUIBundle\(\s*{[^}]*url:\s*["']([^"']+)["']/gi,
+    /new\s+SwaggerUIBundle\(\s*{[^}]*url:\s*["']([^"']+)["']/gi,
+    // Look for data attributes
+    /data-swagger[^>]*["']([^"']*\.json[^"']*)["']/gi,
+    /data-spec[^>]*["']([^"']*\.json[^"']*)["']/gi,
+    // Configuration objects
+    /const\s+\w+\s*=\s*{[^}]*url:\s*["']([^"']+)["']/gi,
+    /var\s+\w+\s*=\s*{[^}]*url:\s*["']([^"']+)["']/gi,
+    // API discovery patterns
+    /api[_-]?docs?[_-]?url[\s=:]+["']([^"']+)["']/gi,
+    /openapi[_-]?url[\s=:]+["']([^"']+)["']/gi
   ];
   
   for (const pattern of swaggerConfigPatterns) {
     let match;
     while ((match = pattern.exec(content)) !== null) {
       try {
-        const specUrl = new URL(match[1], base).href;
+        let specUrl = match[1];
+        // Handle relative URLs
+        if (!specUrl.startsWith('http')) {
+          specUrl = new URL(specUrl, base).href;
+        }
         if (!specs.includes(specUrl)) {
           specs.push(specUrl);
         }
       } catch (e) {
         // Invalid URL, skip
       }
+    }
+  }
+  
+  // Look for inline JSON configurations
+  const jsonConfigRegex = /({[^{}]*["']url["'][^{}]*})/gi;
+  let match;
+  while ((match = jsonConfigRegex.exec(content)) !== null) {
+    try {
+      const config = JSON.parse(match[1]);
+      if (config.url) {
+        const specUrl = new URL(config.url, base).href;
+        if (!specs.includes(specUrl)) {
+          specs.push(specUrl);
+        }
+      }
+    } catch (e) {
+      // Not valid JSON, skip
     }
   }
   
@@ -546,14 +616,16 @@ function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
     /<code[^>]*>(.*?)<\/code>/gis,
     /<pre[^>]*>(.*?)<\/pre>/gis,
     // Tables with endpoints
-    /<table[^>]*class="[^"]*endpoint[^"]*"[^>]*>(.*?)<\/table>/gis,
-    /<table[^>]*class="[^"]*api[^"]*"[^>]*>(.*?)<\/table>/gis
+    /<table[^>]*>(.*?)<\/table>/gis,
+    // Div sections that might contain API info
+    /<div[^>]*class="[^"]*(?:endpoint|api|method)[^"]*"[^>]*>(.*?)<\/div>/gis
   ];
   
-  // HTTP method patterns
-  const httpMethodRegex = /\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&]+)/gi;
-  const curlRegex = /curl\s+[^"']*['"]([^'"]*)\b(GET|POST|PUT|DELETE|PATCH)\b[^'"]*['"][^'"]*([\/\w\-\{\}\.\?=&]+)/gi;
-  const httpRequestRegex = /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&]+)\s+HTTP/gi;
+  // Enhanced HTTP method patterns
+  const httpMethodRegex = /\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&:]+)/gi;
+  const curlRegex = /curl\s+(?:-X\s+)?(GET|POST|PUT|DELETE|PATCH)\s+[^"']*["']([^"']+)["']/gi;
+  const httpRequestRegex = /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&:]+)(?:\s+HTTP|$)/gi;
+  const pathOnlyRegex = /^(\/[\w\-\{\}\.\?=&:\/]+)$/gm;
   
   // Process all patterns
   for (const pattern of patterns) {
@@ -582,8 +654,8 @@ function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
   // Look for curl examples throughout the HTML
   let match;
   while ((match = curlRegex.exec(html)) !== null) {
-    const method = match[2].toUpperCase();
-    const path = match[3];
+    const method = match[1].toUpperCase();
+    const path = match[2];
     
     if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
       endpoints.push({
@@ -610,12 +682,12 @@ function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
     }
   }
   
-  // Look for API documentation tables
+  // Look for API documentation tables with enhanced detection
   const tableRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
-  const cellRegex = /<td[^>]*>(.*?)<\/td>/gis;
   
   while ((match = tableRegex.exec(html)) !== null) {
     const row = match[1];
+    const cellRegex = /<t[hd][^>]*>(.*?)<\/t[hd]>/gis;
     const cells = [];
     let cellMatch;
     
@@ -623,19 +695,61 @@ function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
       cells.push(cellMatch[1].replace(/<[^>]*>/g, '').trim());
     }
     
-    // Check if this looks like an endpoint row (method in first cell, path in second)
+    // Check if this looks like an endpoint row
     if (cells.length >= 2) {
-      const method = cells[0].toUpperCase();
-      const path = cells[1];
-      
-      if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method) && 
-          path.startsWith('/') && 
-          !endpoints.some(e => e.method === method && e.path === path)) {
+      for (let i = 0; i < cells.length - 1; i++) {
+        const method = cells[i].toUpperCase();
+        const path = cells[i + 1];
+        
+        if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method) && 
+            path.startsWith('/') && 
+            !endpoints.some(e => e.method === method && e.path === path)) {
+          endpoints.push({
+            path,
+            method,
+            summary: `${method} ${path}`,
+            description: cells[i + 2] || `Endpoint from documentation table`
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  // Enhanced path-only detection (for when methods are in separate elements)
+  const pathMatches = html.match(pathOnlyRegex);
+  if (pathMatches) {
+    for (const path of pathMatches) {
+      if (path.length > 1 && !endpoints.some(e => e.path === path)) {
+        // Default to GET for path-only matches
         endpoints.push({
           path,
-          method,
-          summary: `${method} ${path}`,
-          description: cells[2] || `Endpoint from documentation table`
+          method: 'GET',
+          summary: `GET ${path}`,
+          description: `Endpoint path discovered from documentation`
+        });
+      }
+    }
+  }
+
+  // Look for OpenAPI/Swagger-specific patterns in HTML
+  const swaggerPatterns = [
+    /["']\/api\/v\d+\/[\w\-\/]+["']/gi,
+    /["']\/v\d+\/[\w\-\/]+["']/gi,
+    /data-path=["']([^"']+)["']/gi,
+    /path:\s*["']([^"']+)["']/gi
+  ];
+  
+  for (const pattern of swaggerPatterns) {
+    let swaggerMatch;
+    while ((swaggerMatch = pattern.exec(html)) !== null) {
+      const path = swaggerMatch[1];
+      if (path.startsWith('/') && !endpoints.some(e => e.path === path)) {
+        endpoints.push({
+          path,
+          method: 'GET',
+          summary: `GET ${path}`,
+          description: `API path discovered from Swagger documentation`
         });
       }
     }
@@ -644,7 +758,130 @@ function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
   return endpoints;
 }
 
-// OpenAI integration for enhancing descriptions
+// Enhanced Firecrawl integration for comprehensive documentation scraping
+async function crawlWithFirecrawl(url: string, logs: string[]): Promise<Endpoint[]> {
+  const endpoints: Endpoint[] = [];
+  
+  try {
+    logs.push(`[Firecrawl] Starting enhanced crawl of: ${url}`);
+    
+    // Make a direct request to Firecrawl API
+    const firecrawlResponse = await fetch('https://api.firecrawl.dev/v0/crawl', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${Deno.env.get('FIRECRAWL_API_KEY') || 'fc-your-key-here'}`
+      },
+      body: JSON.stringify({
+        url: url,
+        crawlerOptions: {
+          limit: 20,
+          maxDepth: 3,
+          includeSubdomains: false
+        },
+        pageOptions: {
+          onlyMainContent: true,
+          includeHtml: true,
+          extractorOptions: {
+            mode: 'llm-extraction',
+            extractionPrompt: `Extract all API endpoints, HTTP methods, paths, and descriptions from this API documentation. 
+                              Look for:
+                              - OpenAPI/Swagger specifications
+                              - REST API endpoints 
+                              - HTTP methods (GET, POST, PUT, DELETE, etc.)
+                              - API paths and routes
+                              - cURL examples
+                              - Request/response examples
+                              Return structured data about each endpoint found.`
+          }
+        }
+      })
+    });
+
+    if (firecrawlResponse.ok) {
+      const data = await firecrawlResponse.json();
+      logs.push(`[Firecrawl] Crawl initiated successfully, job ID: ${data.jobId}`);
+      
+      // Poll for results
+      let attempts = 0;
+      const maxAttempts = 30; // 5 minutes max
+      
+      while (attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
+        
+        const statusResponse = await fetch(`https://api.firecrawl.dev/v0/crawl/status/${data.jobId}`, {
+          headers: {
+            'Authorization': `Bearer ${Deno.env.get('FIRECRAWL_API_KEY') || 'fc-your-key-here'}`
+          }
+        });
+        
+        if (statusResponse.ok) {
+          const status = await statusResponse.json();
+          
+          if (status.status === 'completed') {
+            logs.push(`[Firecrawl] Crawl completed, processing ${status.data?.length || 0} pages`);
+            
+            // Process the crawled data
+            for (const page of status.data || []) {
+              if (page.html || page.content) {
+                const pageEndpoints = parseHtmlForEndpoints(page.html || page.content, page.url || url);
+                endpoints.push(...pageEndpoints);
+                
+                // Also try to parse extracted data if available
+                if (page.extract && typeof page.extract === 'object') {
+                  const extractedEndpoints = parseExtractedApiData(page.extract);
+                  endpoints.push(...extractedEndpoints);
+                }
+              }
+            }
+            
+            logs.push(`[Firecrawl] Extracted ${endpoints.length} endpoints from Firecrawl data`);
+            break;
+          } else if (status.status === 'failed') {
+            logs.push(`[Firecrawl] Crawl failed: ${status.error || 'Unknown error'}`);
+            break;
+          }
+          
+          logs.push(`[Firecrawl] Crawl status: ${status.status}, progress: ${status.current}/${status.total}`);
+        }
+        
+        attempts++;
+      }
+      
+      if (attempts >= maxAttempts) {
+        logs.push(`[Firecrawl] Crawl timeout after ${maxAttempts} attempts`);
+      }
+      
+    } else {
+      logs.push(`[Firecrawl] API request failed: ${firecrawlResponse.status} ${firecrawlResponse.statusText}`);
+    }
+    
+  } catch (error) {
+    logs.push(`[Firecrawl] Error: ${error.message}`);
+  }
+  
+  return endpoints;
+}
+
+// Parse extracted API data from Firecrawl LLM extraction
+function parseExtractedApiData(extractedData: any): Endpoint[] {
+  const endpoints: Endpoint[] = [];
+  
+  if (Array.isArray(extractedData)) {
+    for (const item of extractedData) {
+      if (item.path && item.method) {
+        endpoints.push({
+          path: item.path,
+          method: item.method.toUpperCase(),
+          summary: item.summary || item.description || `${item.method} ${item.path}`,
+          description: item.description || `Endpoint extracted via AI`
+        });
+      }
+    }
+  }
+  
+  return endpoints;
+}
 async function enhanceWithOpenAI(endpoints: Endpoint[], apiKey: string, logs: string[]): Promise<Endpoint[]> {
   if (!apiKey || endpoints.length === 0) return endpoints;
 
