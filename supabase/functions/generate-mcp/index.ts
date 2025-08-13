@@ -112,7 +112,8 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
   logs.push(`[Crawler] Starting crawl of: ${url}`);
 
   if (!isValidUrl(url) || !isSafeUrl(url)) {
-    throw new Error('URL inválida ou não permitida');
+    logs.push(`[Crawler] Invalid or unsafe URL: ${url}`);
+    return { endpoints: [], sourceUrls: [], logs };
   }
 
   // Try to fetch the main page
@@ -122,9 +123,37 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
     visitedUrls.add(url);
     sourceUrls.push(url);
     
-    logs.push(`[Crawler] Fetched main page: ${response.status}`);
+    logs.push(`[Crawler] Fetched main page: ${response.status}, Content length: ${content.length}`);
 
-    // Look for API spec files
+    // Detect if this is a Swagger UI page
+    const isSwaggerUI = content.includes('swagger-ui') || content.includes('SwaggerUIBundle') || 
+                       content.includes('swagger.json') || content.includes('openapi.json');
+    
+    if (isSwaggerUI) {
+      logs.push(`[Crawler] Detected Swagger UI page`);
+      const swaggerSpecs = extractSwaggerUIConfig(content, url);
+      logs.push(`[Crawler] Found ${swaggerSpecs.length} Swagger specs from UI config`);
+      
+      for (const specUrl of swaggerSpecs) {
+        if (!visitedUrls.has(specUrl)) {
+          try {
+            const specResponse = await fetchWithTimeout(specUrl);
+            const specContent = await specResponse.text();
+            visitedUrls.add(specUrl);
+            sourceUrls.push(specUrl);
+            
+            logs.push(`[Crawler] Processing Swagger spec: ${specUrl}`);
+            const endpoints = await parseApiSpec(specUrl, specContent, logs);
+            allEndpoints = allEndpoints.concat(endpoints);
+            logs.push(`[Crawler] Extracted ${endpoints.length} endpoints from Swagger spec`);
+          } catch (error) {
+            logs.push(`[Crawler] Failed to process Swagger spec ${specUrl}: ${error.message}`);
+          }
+        }
+      }
+    }
+
+    // Look for API spec files using improved detection
     const specUrls = await findApiSpecs(url, content);
     logs.push(`[Crawler] Found ${specUrls.length} potential spec URLs`);
 
@@ -132,13 +161,19 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
     for (const specUrl of specUrls) {
       if (visitedUrls.has(specUrl)) continue;
       
+      // Filter out obvious non-spec URLs
+      if (isNonSpecUrl(specUrl)) {
+        logs.push(`[Crawler] Skipping non-spec URL: ${specUrl}`);
+        continue;
+      }
+      
       try {
         const specResponse = await fetchWithTimeout(specUrl);
         const specContent = await specResponse.text();
         visitedUrls.add(specUrl);
         sourceUrls.push(specUrl);
         
-        logs.push(`[Crawler] Processing spec: ${specUrl}`);
+        logs.push(`[Crawler] Processing spec: ${specUrl}, Content type: ${specResponse.headers.get('content-type')}`);
         
         const endpoints = await parseApiSpec(specUrl, specContent, logs);
         allEndpoints = allEndpoints.concat(endpoints);
@@ -149,19 +184,28 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
       }
     }
 
-    // If no specs found, try HTML parsing as fallback
+    // Enhanced HTML parsing as fallback
     if (allEndpoints.length === 0) {
-      logs.push(`[Crawler] No API specs found, trying HTML parsing`);
+      logs.push(`[Crawler] No API specs found, trying enhanced HTML parsing`);
       const htmlEndpoints = parseHtmlForEndpoints(content, url);
       allEndpoints = allEndpoints.concat(htmlEndpoints);
       logs.push(`[Crawler] Extracted ${htmlEndpoints.length} endpoints from HTML`);
+      
+      // Try common API paths as last resort
+      if (allEndpoints.length === 0) {
+        logs.push(`[Crawler] Trying common API endpoints as last resort`);
+        const commonEndpoints = await tryCommonApiPaths(url, logs);
+        allEndpoints = allEndpoints.concat(commonEndpoints);
+      }
     }
 
   } catch (error) {
     logs.push(`[Crawler] Error fetching main page: ${error.message}`);
-    throw error;
+    // Don't throw error, return empty result with logs
+    return { endpoints: [], sourceUrls, logs };
   }
 
+  logs.push(`[Crawler] Total endpoints found: ${allEndpoints.length}`);
   return {
     endpoints: allEndpoints,
     sourceUrls,
@@ -169,45 +213,138 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
   };
 }
 
+// Extract Swagger UI config from JavaScript
+function extractSwaggerUIConfig(content: string, baseUrl: string): string[] {
+  const specs: string[] = [];
+  const base = new URL(baseUrl);
+  
+  // Look for Swagger UI configuration
+  const swaggerConfigPatterns = [
+    /url:\s*["']([^"']+)["']/gi,
+    /spec:\s*["']([^"']+)["']/gi,
+    /SwaggerUIBundle\(\s*{\s*url:\s*["']([^"']+)["']/gi,
+    /"spec":\s*"([^"]+)"/gi,
+    /'spec':\s*'([^']+)'/gi
+  ];
+  
+  for (const pattern of swaggerConfigPatterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      try {
+        const specUrl = new URL(match[1], base).href;
+        if (!specs.includes(specUrl)) {
+          specs.push(specUrl);
+        }
+      } catch (e) {
+        // Invalid URL, skip
+      }
+    }
+  }
+  
+  return specs;
+}
+
+// Check if URL is likely not a spec file
+function isNonSpecUrl(url: string): boolean {
+  const nonSpecExtensions = ['.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.woff', '.woff2', '.ttf'];
+  const lowerUrl = url.toLowerCase();
+  
+  return nonSpecExtensions.some(ext => lowerUrl.endsWith(ext)) ||
+         lowerUrl.includes('static/') ||
+         lowerUrl.includes('assets/') ||
+         lowerUrl.includes('images/') ||
+         lowerUrl.includes('.min.');
+}
+
+// Try common API endpoints
+async function tryCommonApiPaths(baseUrl: string, logs: string[]): Promise<Endpoint[]> {
+  const endpoints: Endpoint[] = [];
+  const base = new URL(baseUrl);
+  
+  const commonApiPaths = [
+    '/api',
+    '/api/v1',
+    '/api/v2', 
+    '/v1',
+    '/v2'
+  ];
+  
+  for (const path of commonApiPaths) {
+    try {
+      const apiUrl = new URL(path, base).href;
+      const response = await fetchWithTimeout(apiUrl, { method: 'HEAD' }, 5000);
+      
+      if (response.ok) {
+        logs.push(`[Crawler] Found working API endpoint: ${apiUrl}`);
+        endpoints.push({
+          path: path,
+          method: 'GET',
+          summary: `API endpoint at ${path}`,
+          description: `Discovered API endpoint`
+        });
+      }
+    } catch (error) {
+      // Ignore errors for common path testing
+    }
+  }
+  
+  return endpoints;
+}
+
 async function findApiSpecs(baseUrl: string, content: string): Promise<string[]> {
   const specs: string[] = [];
   const base = new URL(baseUrl);
 
-  // Common API spec patterns
+  // Enhanced API spec patterns
   const patterns = [
-    /href=["']([^"']*(?:openapi|swagger|api-docs)[^"']*)["']/gi,
+    /href=["']([^"']*(?:openapi|swagger|api-docs|docs)[^"']*)["']/gi,
     /src=["']([^"']*(?:openapi|swagger|api-docs)[^"']*)["']/gi,
-    /"([^"]*\/(?:openapi|swagger|api-docs)(?:\.json|\.yaml|\.yml)?[^"]*)"/gi,
+    /"([^"]*\/(?:openapi|swagger|api-docs|docs)(?:\.json|\.yaml|\.yml)?[^"]*)"/gi,
+    /data-swagger-ui[^>]*url=["']([^"']+)["']/gi,
+    /window\.ui\s*=\s*SwaggerUIBundle\(\s*{\s*url:\s*["']([^"']+)["']/gi
   ];
 
-  // Common spec endpoints to try
+  // Extended common spec endpoints
   const commonPaths = [
     '/openapi.json',
-    '/swagger.json',
+    '/swagger.json', 
     '/api-docs',
     '/api/docs',
     '/docs/api',
     '/swagger/v1/swagger.json',
     '/v1/swagger.json',
     '/api/v1/swagger.json',
+    '/swagger.yaml',
+    '/openapi.yaml',
+    '/api-docs.json',
+    '/swagger/docs/v1',
+    '/docs/swagger.json'
   ];
 
   // Extract from content
   for (const pattern of patterns) {
     let match;
     while ((match = pattern.exec(content)) !== null) {
-      const url = new URL(match[1], base).href;
-      if (!specs.includes(url)) {
-        specs.push(url);
+      try {
+        const url = new URL(match[1], base).href;
+        if (!specs.includes(url) && !isNonSpecUrl(url)) {
+          specs.push(url);
+        }
+      } catch (e) {
+        // Invalid URL, skip
       }
     }
   }
 
   // Try common paths
   for (const path of commonPaths) {
-    const url = new URL(path, base).href;
-    if (!specs.includes(url)) {
-      specs.push(url);
+    try {
+      const url = new URL(path, base).href;
+      if (!specs.includes(url)) {
+        specs.push(url);
+      }
+    } catch (e) {
+      // Invalid URL, skip
     }
   }
 
@@ -332,32 +469,105 @@ function parseParameters(parameters: any[]): Endpoint['parameters'] {
 function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
   const endpoints: Endpoint[] = [];
   
-  // Look for code blocks with HTTP methods and paths
-  const codeBlockRegex = /<code[^>]*>(.*?)<\/code>/gis;
-  const httpMethodRegex = /\b(GET|POST|PUT|DELETE|PATCH)\s+([\/\w\-\{\}\.]+)/gi;
+  // Enhanced patterns for finding endpoints
+  const patterns = [
+    // Code blocks with HTTP methods
+    /<code[^>]*>(.*?)<\/code>/gis,
+    /<pre[^>]*>(.*?)<\/pre>/gis,
+    // Tables with endpoints
+    /<table[^>]*class="[^"]*endpoint[^"]*"[^>]*>(.*?)<\/table>/gis,
+    /<table[^>]*class="[^"]*api[^"]*"[^>]*>(.*?)<\/table>/gis
+  ];
   
+  // HTTP method patterns
+  const httpMethodRegex = /\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&]+)/gi;
+  const curlRegex = /curl\s+[^"']*['"]([^'"]*)\b(GET|POST|PUT|DELETE|PATCH)\b[^'"]*['"][^'"]*([\/\w\-\{\}\.\?=&]+)/gi;
+  const httpRequestRegex = /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&]+)\s+HTTP/gi;
+  
+  // Process all patterns
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(html)) !== null) {
+      const content = match[1].replace(/<[^>]*>/g, '');
+      
+      // Find HTTP methods in content
+      let httpMatch;
+      while ((httpMatch = httpMethodRegex.exec(content)) !== null) {
+        const path = httpMatch[2];
+        const method = httpMatch[1].toUpperCase();
+        
+        if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
+          endpoints.push({
+            path,
+            method,
+            summary: `${method} ${path}`,
+            description: `Endpoint discovered from HTML documentation`
+          });
+        }
+      }
+    }
+  }
+  
+  // Look for curl examples throughout the HTML
   let match;
-  while ((match = codeBlockRegex.exec(html)) !== null) {
-    const codeContent = match[1].replace(/<[^>]*>/g, '');
+  while ((match = curlRegex.exec(html)) !== null) {
+    const method = match[2].toUpperCase();
+    const path = match[3];
     
-    let httpMatch;
-    while ((httpMatch = httpMethodRegex.exec(codeContent)) !== null) {
+    if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
       endpoints.push({
-        path: httpMatch[2],
-        method: httpMatch[1].toUpperCase(),
-        summary: `${httpMatch[1]} ${httpMatch[2]}`,
+        path,
+        method,
+        summary: `${method} ${path}`,
+        description: `Endpoint from cURL example`
       });
     }
   }
   
-  // Look for curl examples
-  const curlRegex = /curl\s+[^"]*"[^"]*\b(GET|POST|PUT|DELETE|PATCH)\b[^"]*"[^"]*([\/\w\-\{\}\.]+)/gi;
-  while ((match = curlRegex.exec(html)) !== null) {
-    endpoints.push({
-      path: match[2],
-      method: match[1].toUpperCase(),
-      summary: `${match[1]} ${match[2]}`,
-    });
+  // Look for HTTP request examples
+  while ((match = httpRequestRegex.exec(html)) !== null) {
+    const method = match[1].toUpperCase();
+    const path = match[2];
+    
+    if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
+      endpoints.push({
+        path,
+        method,
+        summary: `${method} ${path}`,
+        description: `Endpoint from HTTP request example`
+      });
+    }
+  }
+  
+  // Look for API documentation tables
+  const tableRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
+  const cellRegex = /<td[^>]*>(.*?)<\/td>/gis;
+  
+  while ((match = tableRegex.exec(html)) !== null) {
+    const row = match[1];
+    const cells = [];
+    let cellMatch;
+    
+    while ((cellMatch = cellRegex.exec(row)) !== null) {
+      cells.push(cellMatch[1].replace(/<[^>]*>/g, '').trim());
+    }
+    
+    // Check if this looks like an endpoint row (method in first cell, path in second)
+    if (cells.length >= 2) {
+      const method = cells[0].toUpperCase();
+      const path = cells[1];
+      
+      if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method) && 
+          path.startsWith('/') && 
+          !endpoints.some(e => e.method === method && e.path === path)) {
+        endpoints.push({
+          path,
+          method,
+          summary: `${method} ${path}`,
+          description: cells[2] || `Endpoint from documentation table`
+        });
+      }
+    }
   }
 
   return endpoints;
@@ -515,11 +725,16 @@ serve(async (req) => {
       return new Response(
         JSON.stringify({ 
           success: false, 
-          error: 'Nenhum endpoint encontrado na documentação',
-          logs
+          error: 'Nenhum endpoint encontrado na documentação. Verifique se a URL contém documentação de API válida ou tente uma URL diferente.',
+          logs,
+          suggestions: [
+            'Verifique se a URL aponta para documentação de API',
+            'Tente URLs como /api-docs, /swagger, /openapi.json',
+            'Certifique-se de que a documentação está publicamente acessível'
+          ]
         }),
         { 
-          status: 404, 
+          status: 200, 
           headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
         }
       );
