@@ -102,115 +102,186 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout 
   }
 }
 
-// Main crawler function
+// Main crawler function with unlimited depth
 async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ endpoints: Endpoint[], sourceUrls: string[], logs: string[] }> {
   const logs: string[] = [];
   const visitedUrls = new Set<string>();
   const sourceUrls: string[] = [];
+  const urlsToProcess = new Set<string>([url]);
   let allEndpoints: Endpoint[] = [];
+  const maxPages = options.maxPages || 50; // Safety limit to prevent infinite crawling
+  let processedPages = 0;
 
-  logs.push(`[Crawler] Starting crawl of: ${url}`);
+  logs.push(`[Crawler] Starting unlimited depth crawl of: ${url}`);
+  logs.push(`[Crawler] Max pages limit: ${maxPages}`);
 
-  if (!isValidUrl(url) || !isSafeUrl(url)) {
-    logs.push(`[Crawler] Invalid or unsafe URL: ${url}`);
-    return { endpoints: [], sourceUrls: [], logs };
-  }
+  const baseHost = new URL(url).hostname;
 
-  // Try to fetch the main page
-  try {
-    const response = await fetchWithTimeout(url);
-    const content = await response.text();
-    visitedUrls.add(url);
-    sourceUrls.push(url);
-    
-    logs.push(`[Crawler] Fetched main page: ${response.status}, Content length: ${content.length}`);
+  while (urlsToProcess.size > 0 && processedPages < maxPages) {
+    const currentUrl = Array.from(urlsToProcess)[0];
+    urlsToProcess.delete(currentUrl);
 
-    // Detect if this is a Swagger UI page
-    const isSwaggerUI = content.includes('swagger-ui') || content.includes('SwaggerUIBundle') || 
-                       content.includes('swagger.json') || content.includes('openapi.json');
-    
-    if (isSwaggerUI) {
-      logs.push(`[Crawler] Detected Swagger UI page`);
-      const swaggerSpecs = extractSwaggerUIConfig(content, url);
-      logs.push(`[Crawler] Found ${swaggerSpecs.length} Swagger specs from UI config`);
+    if (visitedUrls.has(currentUrl)) continue;
+
+    if (!isValidUrl(currentUrl) || !isSafeUrl(currentUrl)) {
+      logs.push(`[Crawler] Skipping invalid/unsafe URL: ${currentUrl}`);
+      continue;
+    }
+
+    // Only crawl within the same domain for security
+    const currentHost = new URL(currentUrl).hostname;
+    if (currentHost !== baseHost) {
+      logs.push(`[Crawler] Skipping external domain: ${currentUrl}`);
+      continue;
+    }
+
+    try {
+      logs.push(`[Crawler] Processing page ${processedPages + 1}/${maxPages}: ${currentUrl}`);
       
-      for (const specUrl of swaggerSpecs) {
-        if (!visitedUrls.has(specUrl)) {
-          try {
-            const specResponse = await fetchWithTimeout(specUrl);
-            const specContent = await specResponse.text();
-            visitedUrls.add(specUrl);
-            sourceUrls.push(specUrl);
-            
-            logs.push(`[Crawler] Processing Swagger spec: ${specUrl}`);
-            const endpoints = await parseApiSpec(specUrl, specContent, logs);
-            allEndpoints = allEndpoints.concat(endpoints);
-            logs.push(`[Crawler] Extracted ${endpoints.length} endpoints from Swagger spec`);
-          } catch (error) {
-            logs.push(`[Crawler] Failed to process Swagger spec ${specUrl}: ${error.message}`);
+      const response = await fetchWithTimeout(currentUrl, {}, 15000);
+      const content = await response.text();
+      const contentType = response.headers.get('content-type') || '';
+      
+      visitedUrls.add(currentUrl);
+      sourceUrls.push(currentUrl);
+      processedPages++;
+      
+      logs.push(`[Crawler] Fetched: ${response.status}, Content: ${content.length} chars, Type: ${contentType}`);
+
+      // Check if this is a JSON/YAML spec file
+      if (contentType.includes('application/json') || contentType.includes('application/yaml') || 
+          currentUrl.includes('.json') || currentUrl.includes('.yaml') || currentUrl.includes('.yml')) {
+        logs.push(`[Crawler] Processing as spec file: ${currentUrl}`);
+        const endpoints = await parseApiSpec(currentUrl, content, logs);
+        allEndpoints = allEndpoints.concat(endpoints);
+        logs.push(`[Crawler] Extracted ${endpoints.length} endpoints from spec file`);
+        continue;
+      }
+
+      // Detect if this is a Swagger UI page
+      const isSwaggerUI = content.includes('swagger-ui') || content.includes('SwaggerUIBundle') || 
+                         content.includes('swagger.json') || content.includes('openapi.json');
+      
+      if (isSwaggerUI) {
+        logs.push(`[Crawler] Detected Swagger UI page: ${currentUrl}`);
+        const swaggerSpecs = extractSwaggerUIConfig(content, currentUrl);
+        logs.push(`[Crawler] Found ${swaggerSpecs.length} Swagger specs from UI config`);
+        
+        for (const specUrl of swaggerSpecs) {
+          if (!visitedUrls.has(specUrl) && new URL(specUrl).hostname === baseHost) {
+            urlsToProcess.add(specUrl);
           }
         }
       }
-    }
 
-    // Look for API spec files using improved detection
-    const specUrls = await findApiSpecs(url, content);
-    logs.push(`[Crawler] Found ${specUrls.length} potential spec URLs`);
+      // Find all potential API documentation links
+      const documentationLinks = findDocumentationLinks(content, currentUrl);
+      logs.push(`[Crawler] Found ${documentationLinks.length} documentation links on ${currentUrl}`);
 
-    // Process each spec URL
-    for (const specUrl of specUrls) {
-      if (visitedUrls.has(specUrl)) continue;
-      
-      // Filter out obvious non-spec URLs
-      if (isNonSpecUrl(specUrl)) {
-        logs.push(`[Crawler] Skipping non-spec URL: ${specUrl}`);
-        continue;
+      // Add documentation links to processing queue
+      for (const link of documentationLinks) {
+        if (!visitedUrls.has(link) && new URL(link).hostname === baseHost) {
+          urlsToProcess.add(link);
+        }
       }
-      
-      try {
-        const specResponse = await fetchWithTimeout(specUrl);
-        const specContent = await specResponse.text();
-        visitedUrls.add(specUrl);
-        sourceUrls.push(specUrl);
-        
-        logs.push(`[Crawler] Processing spec: ${specUrl}, Content type: ${specResponse.headers.get('content-type')}`);
-        
-        const endpoints = await parseApiSpec(specUrl, specContent, logs);
-        allEndpoints = allEndpoints.concat(endpoints);
-        
-        logs.push(`[Crawler] Extracted ${endpoints.length} endpoints from ${specUrl}`);
-      } catch (error) {
-        logs.push(`[Crawler] Failed to process ${specUrl}: ${error.message}`);
-      }
-    }
 
-    // Enhanced HTML parsing as fallback
-    if (allEndpoints.length === 0) {
-      logs.push(`[Crawler] No API specs found, trying enhanced HTML parsing`);
-      const htmlEndpoints = parseHtmlForEndpoints(content, url);
-      allEndpoints = allEndpoints.concat(htmlEndpoints);
-      logs.push(`[Crawler] Extracted ${htmlEndpoints.length} endpoints from HTML`);
-      
-      // Try common API paths as last resort
-      if (allEndpoints.length === 0) {
-        logs.push(`[Crawler] Trying common API endpoints as last resort`);
-        const commonEndpoints = await tryCommonApiPaths(url, logs);
-        allEndpoints = allEndpoints.concat(commonEndpoints);
-      }
-    }
+      // Look for API spec files using improved detection
+      const specUrls = await findApiSpecs(currentUrl, content);
+      logs.push(`[Crawler] Found ${specUrls.length} potential spec URLs on ${currentUrl}`);
 
-  } catch (error) {
-    logs.push(`[Crawler] Error fetching main page: ${error.message}`);
-    // Don't throw error, return empty result with logs
-    return { endpoints: [], sourceUrls, logs };
+      // Add spec URLs to processing queue
+      for (const specUrl of specUrls) {
+        if (!visitedUrls.has(specUrl) && !isNonSpecUrl(specUrl) && new URL(specUrl).hostname === baseHost) {
+          urlsToProcess.add(specUrl);
+        }
+      }
+
+      // Enhanced HTML parsing for current page
+      const htmlEndpoints = parseHtmlForEndpoints(content, currentUrl);
+      if (htmlEndpoints.length > 0) {
+        allEndpoints = allEndpoints.concat(htmlEndpoints);
+        logs.push(`[Crawler] Extracted ${htmlEndpoints.length} endpoints from HTML on ${currentUrl}`);
+      }
+
+      // Small delay to respect rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+    } catch (error) {
+      logs.push(`[Crawler] Error processing ${currentUrl}: ${error.message}`);
+      continue;
+    }
   }
 
-  logs.push(`[Crawler] Total endpoints found: ${allEndpoints.length}`);
+  // Try common API paths as last resort if no endpoints found
+  if (allEndpoints.length === 0) {
+    logs.push(`[Crawler] No endpoints found, trying common API paths as last resort`);
+    const commonEndpoints = await tryCommonApiPaths(url, logs);
+    allEndpoints = allEndpoints.concat(commonEndpoints);
+  }
+
+  logs.push(`[Crawler] Crawling completed. Processed ${processedPages} pages, found ${allEndpoints.length} total endpoints`);
+  logs.push(`[Crawler] Visited URLs: ${Array.from(visitedUrls).join(', ')}`);
+  
   return {
     endpoints: allEndpoints,
-    sourceUrls,
+    sourceUrls: Array.from(visitedUrls),
     logs
   };
+}
+
+// Find documentation-related links in HTML content
+function findDocumentationLinks(content: string, baseUrl: string): string[] {
+  const links: string[] = [];
+  const base = new URL(baseUrl);
+  
+  // Patterns for documentation links
+  const linkPatterns = [
+    /<a[^>]+href=["']([^"']+)["'][^>]*>/gi,
+    /<link[^>]+href=["']([^"']+)["'][^>]*>/gi
+  ];
+  
+  // Keywords that indicate documentation pages
+  const docKeywords = [
+    'api', 'docs', 'documentation', 'reference', 'guide', 'swagger', 'openapi',
+    'endpoints', 'methods', 'resources', 'v1', 'v2', 'v3', 'latest', 'spec',
+    'schema', 'rest', 'graphql', 'webhook', 'tutorial', 'examples'
+  ];
+  
+  for (const pattern of linkPatterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      try {
+        const fullMatch = match[0];
+        const href = match[1];
+        
+        // Skip anchors, external protocols, and obvious non-doc links
+        if (href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:') ||
+            href.includes('javascript:') || href.startsWith('ftp:')) {
+          continue;
+        }
+        
+        const url = new URL(href, base).href;
+        const urlLower = url.toLowerCase();
+        const fullMatchLower = fullMatch.toLowerCase();
+        
+        // Check if URL or link text contains documentation keywords
+        const isDocLink = docKeywords.some(keyword => 
+          urlLower.includes(keyword) || fullMatchLower.includes(keyword)
+        );
+        
+        // Also include if it's in a docs-like path structure
+        const isDocPath = /\/(api|docs|documentation|reference|guide|v\d+|latest)($|\/)/i.test(url);
+        
+        if ((isDocLink || isDocPath) && !links.includes(url)) {
+          links.push(url);
+        }
+      } catch (e) {
+        // Invalid URL, skip
+      }
+    }
+  }
+  
+  return links;
 }
 
 // Extract Swagger UI config from JavaScript

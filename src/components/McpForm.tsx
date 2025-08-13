@@ -20,7 +20,7 @@ export const McpForm = ({ onGenerate }: McpFormProps) => {
   const [url, setUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
-  const [crawlDepth, setCrawlDepth] = useState(2);
+  const [maxPages, setMaxPages] = useState(50);
   const [respectRobots, setRespectRobots] = useState(true);
   const [allowedDomains, setAllowedDomains] = useState('');
   const [includeWorkflow, setIncludeWorkflow] = useState(false);
@@ -78,7 +78,7 @@ export const McpForm = ({ onGenerate }: McpFormProps) => {
         url: url.trim(),
         openaiApiKey: apiKey.trim(),
         options: {
-          crawlDepth,
+          maxPages,
           respectRobots,
           allowedDomains: allowedDomains.split(',').map(d => d.trim()).filter(d => d),
           includeWorkflow,
@@ -206,15 +206,18 @@ export const McpForm = ({ onGenerate }: McpFormProps) => {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="crawl-depth">Profundidade do Crawl</Label>
+                <Label htmlFor="max-pages">Limite de Páginas para Crawling</Label>
                 <Input
-                  id="crawl-depth"
+                  id="max-pages"
                   type="number"
                   min="1"
-                  max="5"
-                  value={crawlDepth}
-                  onChange={(e) => setCrawlDepth(parseInt(e.target.value) || 2)}
+                  max="200"
+                  value={maxPages}
+                  onChange={(e) => setMaxPages(parseInt(e.target.value) || 50)}
                 />
+                <p className="text-xs text-muted-foreground">
+                  Máximo de páginas a processar (1-200). Mais páginas = mais endpoints, mas processamento mais lento.
+                </p>
               </div>
 
               <div className="space-y-4">

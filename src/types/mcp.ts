@@ -95,7 +95,7 @@ export interface GenerateMcpRequest {
   url: string;
   openaiApiKey: string;
   options?: {
-    crawlDepth?: number;
+    maxPages?: number;
     respectRobots?: boolean;
     allowedDomains?: string[];
     includeWorkflow?: boolean;
