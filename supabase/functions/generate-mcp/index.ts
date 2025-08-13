@@ -241,11 +241,84 @@ async function crawlApiDocumentation(url: string, options: any = {}): Promise<{ 
     }
   }
 
-      // Try Firecrawl for comprehensive documentation scraping
-      if (allEndpoints.length < 5) { // Only use Firecrawl if we haven't found many endpoints
-        logs.push(`[Crawler] Found few endpoints (${allEndpoints.length}), trying Firecrawl for comprehensive scraping`);
-        const firecrawlEndpoints = await crawlWithFirecrawl(url, logs);
-        allEndpoints = allEndpoints.concat(firecrawlEndpoints);
+      // If we found very few endpoints, try multiple enhancement strategies
+      if (allEndpoints.length < 10 && options.useFirecrawl !== false) {
+        logs.push(`[Crawler] Found few endpoints (${allEndpoints.length}), trying enhanced scraping strategies`);
+        
+        // Strategy 1: Try Firecrawl for comprehensive scraping
+        try {
+          const firecrawlEndpoints = await crawlWithFirecrawl(url, logs);
+          allEndpoints = allEndpoints.concat(firecrawlEndpoints);
+          logs.push(`[Firecrawl] Added ${firecrawlEndpoints.length} endpoints`);
+        } catch (error) {
+          logs.push(`[Firecrawl] Error: ${error.message}`);
+        }
+        
+        // Strategy 2: Deep HTML analysis of the main page
+        if (allEndpoints.length < 10) {
+          logs.push('[Crawler] Performing deep HTML analysis of main documentation page');
+          try {
+            const mainPageResponse = await fetchWithTimeout(url);
+            if (mainPageResponse.ok) {
+              const mainContent = await mainPageResponse.text();
+              
+              // Enhanced HTML parsing with more aggressive patterns
+              const htmlEndpoints = parseHtmlForEndpoints(mainContent, url);
+              
+              // Filter out duplicates
+              const newEndpoints = htmlEndpoints.filter(ep => 
+                !allEndpoints.some(existing => existing.path === ep.path && existing.method === ep.method)
+              );
+              
+              allEndpoints = allEndpoints.concat(newEndpoints);
+              logs.push(`[Crawler] Deep HTML analysis found ${newEndpoints.length} additional endpoints`);
+            }
+          } catch (error) {
+            logs.push(`[Crawler] Deep HTML analysis failed: ${error.message}`);
+          }
+        }
+        
+        // Strategy 3: Try to access swagger.json with different headers and methods
+        if (allEndpoints.length < 10) {
+          logs.push('[Crawler] Trying alternative access methods for API specs');
+          const alternativeHeaders = [
+            { 'Accept': 'application/json' },
+            { 'Accept': 'text/plain' },
+            { 'User-Agent': 'Mozilla/5.0 (compatible; API-Crawler/1.0)' },
+            { 'Accept': 'application/json', 'User-Agent': 'Swagger-UI' },
+            { 'Accept': '*/*', 'User-Agent': 'curl/7.68.0' }
+          ];
+          
+          const specPaths = ['/swagger.json', '/openapi.json', '/api-docs/swagger.json', '/docs/swagger.json'];
+          
+          for (const headers of alternativeHeaders) {
+            for (const specPath of specPaths) {
+              try {
+                const specUrl = new URL(specPath, new URL(url).origin).href;
+                const specResponse = await fetchWithTimeout(specUrl, { headers });
+                if (specResponse.ok) {
+                  const content = await specResponse.text();
+                  if (content.trim().startsWith('{') || content.trim().startsWith('openapi:')) {
+                    try {
+                      const spec = JSON.parse(content);
+                      if (spec.paths && Object.keys(spec.paths).length > 0) {
+                        const specEndpoints = parseOpenApiSpec(spec, new URL(url).origin);
+                        allEndpoints = allEndpoints.concat(specEndpoints);
+                        logs.push(`[Crawler] Alternative access found ${specEndpoints.length} endpoints from ${specUrl}`);
+                        break;
+                      }
+                    } catch (e) {
+                      // Try YAML parsing or continue
+                    }
+                  }
+                }
+              } catch (error) {
+                // Continue with next combination
+              }
+            }
+            if (allEndpoints.length >= 10) break;
+          }
+        }
       }
       
       // Try common API paths as last resort if still no endpoints found
@@ -322,63 +395,94 @@ function findDocumentationLinks(content: string, baseUrl: string): string[] {
 
 // Enhanced Swagger UI config extraction
 function extractSwaggerUIConfig(content: string, baseUrl: string): string[] {
+  console.log('[SwaggerUI] Advanced configuration extraction...');
   const specs: string[] = [];
   const base = new URL(baseUrl);
   
-  // Enhanced patterns for Swagger UI configuration
+  // Advanced patterns for Swagger UI detection
   const swaggerConfigPatterns = [
-    // Standard Swagger UI patterns
-    /url:\s*["']([^"']+)["']/gi,
-    /spec:\s*["']([^"']+)["']/gi,
-    /SwaggerUIBundle\(\s*{\s*url:\s*["']([^"']+)["']/gi,
-    /"spec":\s*"([^"]+)"/gi,
-    /'spec':\s*'([^']+)'/gi,
-    // More specific patterns
-    /window\.ui\s*=\s*SwaggerUIBundle\(\s*{[^}]*url:\s*["']([^"']+)["']/gi,
-    /new\s+SwaggerUIBundle\(\s*{[^}]*url:\s*["']([^"']+)["']/gi,
-    // Look for data attributes
-    /data-swagger[^>]*["']([^"']*\.json[^"']*)["']/gi,
-    /data-spec[^>]*["']([^"']*\.json[^"']*)["']/gi,
-    // Configuration objects
-    /const\s+\w+\s*=\s*{[^}]*url:\s*["']([^"']+)["']/gi,
-    /var\s+\w+\s*=\s*{[^}]*url:\s*["']([^"']+)["']/gi,
-    // API discovery patterns
-    /api[_-]?docs?[_-]?url[\s=:]+["']([^"']+)["']/gi,
-    /openapi[_-]?url[\s=:]+["']([^"']+)["']/gi
+    // Standard SwaggerUIBundle patterns
+    /SwaggerUIBundle\(\s*\{[^}]*url:\s*["']([^"']+)["']/gi,
+    /SwaggerUIBundle\(\s*\{[^}]*spec:\s*["']([^"']+)["']/gi,
+    
+    // JavaScript variable assignments and window objects
+    /(?:url|spec|openapi):\s*["']([^"']+\.(?:json|yaml|yml))["']/gi,
+    /window\.ui\s*=\s*SwaggerUIBundle\(\s*\{[^}]*url:\s*["']([^"']+)["']/gi,
+    
+    // HTML data attributes
+    /data-(?:url|spec|swagger)=["']([^"']+)["']/gi,
+    
+    // Script tag sources with spec files
+    /<script[^>]*src=["']([^"']*(?:swagger|openapi|spec)[^"']*\.json)["']/gi,
+    
+    // Common patterns in documentation and config files
+    /["']([^"']*\/(?:swagger|openapi|api-docs)(?:\/[^"']*)?\.json)["']/gi,
+    /["']([^"']*\/v\d+\/swagger\.json)["']/gi,
+    
+    // Direct API endpoint patterns in content
+    /\/api\/(?:v\d+\/)?(?:swagger|openapi|docs)(?:\.json)?/gi,
+    
+    // Configuration block patterns
+    /(?:const|var|let)\s+\w+\s*=\s*\{[^}]*(?:url|spec):\s*["']([^"']+)["']/gi,
+    
+    // YAML frontmatter or config patterns
+    /swagger[_-]?(?:ui[_-]?)?(?:url|spec):\s*["']([^"']+)["']/gi,
+    
+    // API documentation specific patterns
+    /(?:baseURL|base_url|apiUrl|api_url):\s*["']([^"']*\/(?:swagger|openapi)[^"']*)["']/gi
   ];
   
   for (const pattern of swaggerConfigPatterns) {
     let match;
     while ((match = pattern.exec(content)) !== null) {
-      try {
-        let specUrl = match[1];
-        // Handle relative URLs
-        if (!specUrl.startsWith('http')) {
-          specUrl = new URL(specUrl, base).href;
+      const specUrl = match[1];
+      if (specUrl && !specs.includes(specUrl)) {
+        try {
+          const fullUrl = new URL(specUrl, base).toString();
+          specs.push(fullUrl);
+          console.log(`[SwaggerUI] Found spec URL: ${fullUrl}`);
+        } catch (e) {
+          console.log(`[SwaggerUI] Invalid URL skipped: ${specUrl}`);
         }
-        if (!specs.includes(specUrl)) {
-          specs.push(specUrl);
-        }
-      } catch (e) {
-        // Invalid URL, skip
       }
     }
   }
   
-  // Look for inline JSON configurations
-  const jsonConfigRegex = /({[^{}]*["']url["'][^{}]*})/gi;
-  let match;
-  while ((match = jsonConfigRegex.exec(content)) !== null) {
+  // Also look for inline JSON specs
+  const inlineSpecMatch = content.match(/(?:spec|swagger|openapi):\s*(\{[\s\S]*?\}),?\s*(?:dom_id|url|plugins)/i);
+  if (inlineSpecMatch) {
+    console.log('[SwaggerUI] Found inline spec definition');
     try {
-      const config = JSON.parse(match[1]);
-      if (config.url) {
-        const specUrl = new URL(config.url, base).href;
-        if (!specs.includes(specUrl)) {
-          specs.push(specUrl);
-        }
+      const inlineSpec = JSON.parse(inlineSpecMatch[1]);
+      if (inlineSpec.paths) {
+        specs.push('inline-spec');
       }
     } catch (e) {
-      // Not valid JSON, skip
+      console.log('[SwaggerUI] Failed to parse inline spec');
+    }
+  }
+  
+  // Extract from JavaScript variables and function calls
+  const jsVarPatterns = [
+    /(?:spec|config|options)\.url\s*=\s*["']([^"']+)["']/gi,
+    /(?:spec|config|options)\["url"\]\s*=\s*["']([^"']+)["']/gi,
+    /fetch\(\s*["']([^"']*swagger[^"']*)["']/gi,
+    /axios\.get\(\s*["']([^"']*swagger[^"']*)["']/gi
+  ];
+  
+  for (const pattern of jsVarPatterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      const specUrl = match[1];
+      try {
+        const fullUrl = new URL(specUrl, base).toString();
+        if (!specs.includes(fullUrl)) {
+          specs.push(fullUrl);
+          console.log(`[SwaggerUI] Found JS variable spec: ${fullUrl}`);
+        }
+      } catch (e) {
+        // Invalid URL, skip
+      }
     }
   }
   
@@ -608,153 +712,175 @@ function parseParameters(parameters: any[]): Endpoint['parameters'] {
 }
 
 function parseHtmlForEndpoints(html: string, baseUrl: string): Endpoint[] {
+  console.log('[Parser] Advanced HTML parsing for API endpoints...');
   const endpoints: Endpoint[] = [];
   
-  // Enhanced patterns for finding endpoints
+  // Advanced endpoint extraction patterns targeting Swagger UI specifically
   const patterns = [
-    // Code blocks with HTTP methods
+    // Swagger UI DOM structure patterns (most specific first)
+    /<div[^>]*class="[^"]*opblock[^"]*"[^>]*>[\s\S]*?<span[^>]*class="[^"]*opblock-summary-method[^"]*"[^>]*>(GET|POST|PUT|DELETE|PATCH)<\/span>[\s\S]*?<span[^>]*class="[^"]*opblock-summary-path[^"]*"[^>]*>([^<]+)<\/span>/gi,
+    
+    // Table-based documentation
+    /<tr[^>]*>[\s\S]*?<td[^>]*>(GET|POST|PUT|DELETE|PATCH)<\/td>[\s\S]*?<td[^>]*>([^<]+)<\/td>/gi,
+    
+    // Code blocks with curl examples
+    /curl[^"']*-X\s+(GET|POST|PUT|DELETE|PATCH)[^"']*["']([^"']+)["']/gi,
+    
+    // REST endpoint patterns in text
+    /(GET|POST|PUT|DELETE|PATCH)\s+(\/[^\s<>'"]*)/gi,
+    
+    // API endpoint patterns in href attributes
+    /href=["']([^"']*\/api\/[^"']*)["']/gi,
+    
+    // JSON examples with endpoint references
+    /"(?:url|endpoint|path)":\s*["']([^"']*\/[^"']*)["']/gi,
+    
+    // OpenAPI operation objects in script tags
+    /<script[^>]*>[\s\S]*?"(\/[^"]*)":\s*\{[\s\S]*?"(get|post|put|delete|patch)"/gi,
+    
+    // More specific patterns for different documentation styles
     /<code[^>]*>(.*?)<\/code>/gis,
-    /<pre[^>]*>(.*?)<\/pre>/gis,
-    // Tables with endpoints
-    /<table[^>]*>(.*?)<\/table>/gis,
-    // Div sections that might contain API info
-    /<div[^>]*class="[^"]*(?:endpoint|api|method)[^"]*"[^>]*>(.*?)<\/div>/gis
+    /<pre[^>]*>(.*?)<\/pre>/gis
   ];
   
-  // Enhanced HTTP method patterns
-  const httpMethodRegex = /\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&:]+)/gi;
-  const curlRegex = /curl\s+(?:-X\s+)?(GET|POST|PUT|DELETE|PATCH)\s+[^"']*["']([^"']+)["']/gi;
-  const httpRequestRegex = /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\?=&:]+)(?:\s+HTTP|$)/gi;
-  const pathOnlyRegex = /^(\/[\w\-\{\}\.\?=&:\/]+)$/gm;
-  
-  // Process all patterns
+  // Extract endpoints using targeted patterns
   for (const pattern of patterns) {
     let match;
     while ((match = pattern.exec(html)) !== null) {
-      const content = match[1].replace(/<[^>]*>/g, '');
+      let method = '';
+      let path = '';
+      let summary = '';
       
-      // Find HTTP methods in content
-      let httpMatch;
-      while ((httpMatch = httpMethodRegex.exec(content)) !== null) {
-        const path = httpMatch[2];
-        const method = httpMatch[1].toUpperCase();
+      // Handle different match groups based on pattern
+      if (pattern.source.includes('opblock')) {
+        method = match[1];
+        path = match[2].trim();
+        summary = 'Extracted from Swagger UI DOM';
+      } else if (pattern.source.includes('<tr')) {
+        method = match[1];
+        path = match[2].trim();
+        summary = 'Extracted from documentation table';
+      } else if (pattern.source.includes('curl')) {
+        method = match[1];
+        path = match[2];
+        summary = 'Extracted from curl example';
+      } else if (pattern.source.includes('href')) {
+        path = match[1];
+        method = 'GET'; // Default for href links
+        summary = 'Extracted from API link';
+      } else if (pattern.source.includes('script')) {
+        path = match[1];
+        method = match[2].toUpperCase();
+        summary = 'Extracted from OpenAPI schema';
+      } else if (pattern.source.includes('GET|POST')) {
+        method = match[1];
+        path = match[2];
+        summary = 'Extracted from HTTP method pattern';
+      } else {
+        // Handle code/pre blocks
+        const content = match[1].replace(/<[^>]*>/g, '');
+        const methodMatch = content.match(/(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)/i);
+        const pathMatch = content.match(/(\/[^\s<>'"]*)/);
         
-        if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
-          endpoints.push({
-            path,
-            method,
-            summary: `${method} ${path}`,
-            description: `Endpoint discovered from HTML documentation`
-          });
+        if (methodMatch && pathMatch) {
+          method = methodMatch[1].toUpperCase();
+          path = pathMatch[1];
+          summary = 'Extracted from code block';
         }
       }
-    }
-  }
-  
-  // Look for curl examples throughout the HTML
-  let match;
-  while ((match = curlRegex.exec(html)) !== null) {
-    const method = match[1].toUpperCase();
-    const path = match[2];
-    
-    if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
-      endpoints.push({
-        path,
-        method,
-        summary: `${method} ${path}`,
-        description: `Endpoint from cURL example`
-      });
-    }
-  }
-  
-  // Look for HTTP request examples
-  while ((match = httpRequestRegex.exec(html)) !== null) {
-    const method = match[1].toUpperCase();
-    const path = match[2];
-    
-    if (path.startsWith('/') && !endpoints.some(e => e.method === method && e.path === path)) {
-      endpoints.push({
-        path,
-        method,
-        summary: `${method} ${path}`,
-        description: `Endpoint from HTTP request example`
-      });
-    }
-  }
-  
-  // Look for API documentation tables with enhanced detection
-  const tableRegex = /<tr[^>]*>(.*?)<\/tr>/gis;
-  
-  while ((match = tableRegex.exec(html)) !== null) {
-    const row = match[1];
-    const cellRegex = /<t[hd][^>]*>(.*?)<\/t[hd]>/gis;
-    const cells = [];
-    let cellMatch;
-    
-    while ((cellMatch = cellRegex.exec(row)) !== null) {
-      cells.push(cellMatch[1].replace(/<[^>]*>/g, '').trim());
-    }
-    
-    // Check if this looks like an endpoint row
-    if (cells.length >= 2) {
-      for (let i = 0; i < cells.length - 1; i++) {
-        const method = cells[i].toUpperCase();
-        const path = cells[i + 1];
-        
-        if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method) && 
-            path.startsWith('/') && 
-            !endpoints.some(e => e.method === method && e.path === path)) {
-          endpoints.push({
-            path,
-            method,
-            summary: `${method} ${path}`,
-            description: cells[i + 2] || `Endpoint from documentation table`
-          });
-          break;
-        }
-      }
-    }
-  }
-
-  // Enhanced path-only detection (for when methods are in separate elements)
-  const pathMatches = html.match(pathOnlyRegex);
-  if (pathMatches) {
-    for (const path of pathMatches) {
-      if (path.length > 1 && !endpoints.some(e => e.path === path)) {
-        // Default to GET for path-only matches
+      
+      // Clean and validate path
+      path = path.trim().replace(/\s+/g, '');
+      if (path.startsWith('/') && method && !endpoints.some(e => e.path === path && e.method === method)) {
         endpoints.push({
           path,
-          method: 'GET',
-          summary: `GET ${path}`,
-          description: `Endpoint path discovered from documentation`
+          method: method.toUpperCase(),
+          summary,
+          description: `Found in HTML content at ${baseUrl}`,
         });
       }
     }
   }
-
-  // Look for OpenAPI/Swagger-specific patterns in HTML
-  const swaggerPatterns = [
-    /["']\/api\/v\d+\/[\w\-\/]+["']/gi,
-    /["']\/v\d+\/[\w\-\/]+["']/gi,
-    /data-path=["']([^"']+)["']/gi,
-    /path:\s*["']([^"']+)["']/gi
+  
+  // Try to extract from swagger-ui specific DOM structures
+  const swaggerOperations = html.match(/<div[^>]*class="[^"]*operation[^"]*"[^>]*>[\s\S]*?<\/div>/gi);
+  if (swaggerOperations) {
+    for (const operation of swaggerOperations) {
+      const methodMatch = operation.match(/class="[^"]*opblock-summary-method[^"]*"[^>]*>([^<]+)/);
+      const pathMatch = operation.match(/class="[^"]*opblock-summary-path[^"]*"[^>]*>([^<]+)/);
+      const summaryMatch = operation.match(/class="[^"]*opblock-summary[^"]*"[^>]*>([^<]+)/);
+      
+      if (methodMatch && pathMatch) {
+        const method = methodMatch[1].trim().toUpperCase();
+        const path = pathMatch[1].trim();
+        const summary = summaryMatch ? summaryMatch[1].trim() : 'Swagger UI operation';
+        
+        if (path.startsWith('/') && !endpoints.some(e => e.path === path && e.method === method)) {
+          endpoints.push({
+            path,
+            method,
+            summary,
+            description: 'Extracted from Swagger UI operation block'
+          });
+        }
+      }
+    }
+  }
+  
+  // Enhanced pattern matching for endpoints in JavaScript/JSON content
+  const jsPatterns = [
+    /"(\/api\/[^"]+)"/gi,
+    /"(\/v\d+\/[^"]+)"/gi,
+    /path:\s*["']([^"']+)["']/gi,
+    /endpoint:\s*["']([^"']+)["']/gi,
+    /'(\/api\/[^']+)'/gi,
+    /'(\/v\d+\/[^']+)'/gi,
   ];
   
-  for (const pattern of swaggerPatterns) {
-    let swaggerMatch;
-    while ((swaggerMatch = pattern.exec(html)) !== null) {
-      const path = swaggerMatch[1];
-      if (path.startsWith('/') && !endpoints.some(e => e.path === path)) {
+  for (const pattern of jsPatterns) {
+    let match;
+    while ((match = pattern.exec(html)) !== null) {
+      const path = match[1];
+      if (path.startsWith('/') && path.length > 1 && !endpoints.some(e => e.path === path)) {
         endpoints.push({
           path,
-          method: 'GET',
-          summary: `GET ${path}`,
-          description: `API path discovered from Swagger documentation`
+          method: 'GET', // Default method
+          summary: 'GET ' + path,
+          description: 'Endpoint extracted from JavaScript content'
         });
       }
     }
   }
-
+  
+  // Look for method-path pairs in tables more aggressively
+  const tableRows = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi);
+  if (tableRows) {
+    for (const row of tableRows) {
+      const cells = row.match(/<t[hd][^>]*>([^<]*)<\/t[hd]>/gi);
+      if (cells && cells.length >= 2) {
+        const cleanCells = cells.map(cell => cell.replace(/<[^>]*>/g, '').trim());
+        
+        // Look for method-path combinations
+        for (let i = 0; i < cleanCells.length - 1; i++) {
+          const method = cleanCells[i].toUpperCase();
+          const path = cleanCells[i + 1];
+          
+          if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(method) && 
+              path.startsWith('/') && 
+              !endpoints.some(e => e.method === method && e.path === path)) {
+            endpoints.push({
+              path,
+              method,
+              summary: `${method} ${path}`,
+              description: cleanCells[i + 2] || 'Endpoint from documentation table'
+            });
+          }
+        }
+      }
+    }
+  }
+  
+  console.log(`[Parser] Found ${endpoints.length} endpoints from advanced HTML parsing`);
   return endpoints;
 }
 
@@ -883,19 +1009,14 @@ function parseExtractedApiData(extractedData: any): Endpoint[] {
   return endpoints;
 }
 async function enhanceWithOpenAI(endpoints: Endpoint[], apiKey: string, logs: string[]): Promise<Endpoint[]> {
-  if (!apiKey || endpoints.length === 0) return endpoints;
-
+  console.log('[OpenAI] Enhancing endpoints with AI...');
   logs.push(`[OpenAI] Enhancing ${endpoints.length} endpoints with AI`);
+  
+  if (!apiKey || endpoints.length === 0) {
+    return endpoints;
+  }
 
   try {
-    const prompt = `
-Analyze these API endpoints and enhance their descriptions. Return a JSON array with the same structure but improved descriptions:
-
-${JSON.stringify(endpoints.slice(0, 10), null, 2)}
-
-Make descriptions concise, clear and professional. Infer functionality from method and path.
-`;
-
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -905,26 +1026,54 @@ Make descriptions concise, clear and professional. Infer functionality from meth
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: 'You are an API documentation expert. Enhance endpoint descriptions to be clear and professional.' },
-          { role: 'user', content: prompt }
+          {
+            role: 'system',
+            content: 'You are an API documentation expert. Enhance API endpoint descriptions to be clear and useful. Always respond with valid JSON only - no markdown formatting, no code blocks, no explanatory text.'
+          },
+          {
+            role: 'user',
+            content: `Enhance these API endpoints with better descriptions, summaries, and parameter information. Return ONLY the JSON array:\n\n${JSON.stringify(endpoints.slice(0, 20), null, 2)}`
+          }
         ],
-        temperature: 0.3,
+        temperature: 0.1,
+        max_tokens: 4000,
       }),
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      const enhancedEndpoints = JSON.parse(data.choices[0].message.content);
-      logs.push(`[OpenAI] Successfully enhanced endpoint descriptions`);
-      return enhancedEndpoints;
-    } else {
-      logs.push(`[OpenAI] Failed to enhance descriptions: ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`OpenAI API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    let content = data.choices[0].message.content.trim();
+    
+    // Clean up markdown formatting if present
+    content = content.replace(/```json\s*/g, '').replace(/```\s*$/g, '').trim();
+    
+    // Try to find JSON array in the response
+    const jsonMatch = content.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      content = jsonMatch[0];
+    }
+    
+    try {
+      const enhancedEndpoints = JSON.parse(content);
+      if (Array.isArray(enhancedEndpoints) && enhancedEndpoints.length > 0) {
+        logs.push('[OpenAI] Successfully enhanced endpoint descriptions');
+        return enhancedEndpoints;
+      } else {
+        logs.push('[OpenAI] Enhanced response was not a valid array, using original endpoints');
+        return endpoints;
+      }
+    } catch (parseError) {
+      logs.push(`[OpenAI] JSON parse error: ${parseError.message}, using original endpoints`);
+      console.log('[OpenAI] Raw content that failed to parse:', content.substring(0, 500));
+      return endpoints;
     }
   } catch (error) {
-    logs.push(`[OpenAI] Error enhancing descriptions: ${error.message}`);
+    logs.push(`[OpenAI] Error: ${error.message}`);
+    return endpoints;
   }
-
-  return endpoints;
 }
 
 // Generate MCP from endpoints
