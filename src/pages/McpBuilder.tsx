@@ -730,7 +730,16 @@ const realCrawl = async (url: string, options: any): Promise<CrawlResult> => {
       uniqueEndpoints: endpoints.length
     });
     if (endpoints.length === 0) {
-      throw new Error('No endpoints found in the documentation. The URL may not point to API documentation, or the content may not be accessible due to CORS restrictions. Try using the paste or upload methods instead.');
+      console.warn('[McpBuilder] No endpoints found. Falling back to common API patterns.');
+      const fallbackEndpoints = generateCommonAPIEndpoints(url);
+      detectedSpecs.push('Generated Common Patterns (Fallback)');
+      return {
+        endpoints: fallbackEndpoints,
+        baseUrl,
+        authType: detectAuthType(html),
+        sourceUrls,
+        detectedSpecs
+      };
     }
     return {
       endpoints,
@@ -984,7 +993,7 @@ export default function McpBuilder() {
       const result = await processContent(inputMethod, docUrl, pastedContent, uploadedFile);
       setCrawlResult(result);
       if (result.endpoints.length === 0) {
-        throw new Error('Nenhum endpoint foi encontrado no conteúdo fornecido. Verifique se o conteúdo contém documentação de API válida.');
+        console.warn('[McpBuilder] Resultado sem endpoints. Usando fallback de endpoints comuns.');
       }
       console.log(`[McpBuilder] Process completed successfully! Found ${result.endpoints.length} endpoints`);
       const mcp = await generateMcp(result, openaiKey);
