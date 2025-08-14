@@ -762,7 +762,7 @@ const extractEndpointsFromGenericJSON = (jsonContent: any): Endpoint[] => {
 };
 
 // Crawl documentation across multiple pages using LLM-assisted link discovery
-const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: number): Promise<CrawlResult> => {
+const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: number, maxPages: number): Promise<CrawlResult> => {
   const visited = new Set<string>();
   const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
   const endpoints: Endpoint[] = [];
@@ -773,6 +773,7 @@ const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: nu
   let firstHtml = '';
 
   while (queue.length > 0) {
+    if (visited.size >= maxPages) break;
     const { url, depth } = queue.shift()!;
     if (visited.has(url) || depth > maxDepth) continue;
     visited.add(url);
@@ -783,9 +784,9 @@ const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: nu
     if (!firstHtml) firstHtml = html;
     sourceUrls.push(url);
 
-    // Try to detect and parse OpenAPI/Swagger specs on this page
     const specUrls = await findSpecUrls(html, url);
     for (const specUrl of specUrls) {
+      if (visited.size >= maxPages) break;
       try {
         const specHtml = await fetchPageWithStrategies(specUrl);
         if (specHtml && specHtml.length > 50) {
@@ -805,7 +806,6 @@ const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: nu
       }
     }
 
-    // Parse HTML endpoints
     const htmlEndpoints = await parseHTMLDocumentation(html, url);
     for (const ep of htmlEndpoints) {
       const key = `${ep.method}:${ep.path}`;
@@ -815,7 +815,6 @@ const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: nu
       }
     }
 
-    // Link discovery for further crawl
     const linkCandidates = extractLinksFromHtml(html, url);
     let llmLinks: string[] = [];
     if (apiKey) {
@@ -823,7 +822,7 @@ const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: nu
     }
     const nextLinks = Array.from(new Set([...linkCandidates, ...llmLinks]))
       .filter(u => !visited.has(u))
-      .slice(0, 20);
+      .slice(0, Math.max(0, maxPages - visited.size));
     nextLinks.forEach(u => queue.push({ url: u, depth: depth + 1 }));
   }
 
@@ -837,15 +836,43 @@ const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: nu
   };
 };
 
+// Merge two crawl results, preferring endpoints with requestBody when duplicates
+const mergeCrawlResults = (a: CrawlResult, b: CrawlResult): CrawlResult => {
+  const map = new Map<string, Endpoint>();
+  const push = (ep: Endpoint) => {
+    const key = `${ep.method}:${ep.path}`;
+    if (!map.has(key)) {
+      map.set(key, ep);
+      return;
+    }
+    const existing = map.get(key)!;
+    const hasBodyExisting = Boolean((existing as any).requestBody);
+    const hasBodyNew = Boolean((ep as any).requestBody);
+    if (hasBodyNew && !hasBodyExisting) {
+      map.set(key, ep);
+    }
+  };
+  a.endpoints.forEach(push);
+  b.endpoints.forEach(push);
+  return {
+    endpoints: Array.from(map.values()),
+    baseUrl: a.baseUrl || b.baseUrl,
+    authType: a.authType || b.authType,
+    sourceUrls: Array.from(new Set([...(a.sourceUrls || []), ...(b.sourceUrls || [])])),
+    detectedSpecs: Array.from(new Set([...(a.detectedSpecs || []), ...(b.detectedSpecs || [])]))
+  };
+};
+
 // Process URL with LLM-assisted crawl
-const processUrlWithLLMCrawl = async (url: string, apiKey: string, maxDepth: number): Promise<CrawlResult> => {
+const processUrlWithLLMCrawl = async (url: string, apiKey: string, maxDepth: number, maxPages: number): Promise<CrawlResult> => {
   if (!url.startsWith('https://')) {
     throw new Error('Only HTTPS URLs are allowed');
   }
   if (url.includes('localhost') || url.includes('127.0.0.1')) {
     throw new Error('Local URLs are not allowed for security reasons');
   }
-  return await crawlDocumentation(url, apiKey, Math.max(0, Math.min(maxDepth, 4)));
+  // No artificial cap: use provided limits
+  return await crawlDocumentation(url, apiKey, Math.max(0, maxDepth), Math.max(1, maxPages));
 };
 
 // Process content from different input methods
@@ -855,7 +882,7 @@ const processContent = async (method: 'url' | 'paste' | 'upload', url: string, c
   let sourceUrl = url || 'manual-input';
   switch (method) {
     case 'url':
-      return await realCrawl(url, {});
+      return await processUrlWithLLMCrawl(url, {}, 10, 2000); // Default to a high maxPages for content
     case 'paste':
       contentToProcess = content;
       console.log(`[McpBuilder] Processing pasted content, length: ${content.length}`);
@@ -1020,7 +1047,7 @@ export default function McpBuilder() {
   const [mcpSpec, setMcpSpec] = useState<McpSpec | null>(null);
   const [crawlResult, setCrawlResult] = useState<CrawlResult | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [crawlDepth, setCrawlDepth] = useState(2);
+  const [crawlDepth, setCrawlDepth] = useState(10);
   const [respectRobots, setRespectRobots] = useState(true);
   const [methodFilter, setMethodFilter] = useState<string>('all');
   const [tagFilter, setTagFilter] = useState<string>('all');
@@ -1029,6 +1056,7 @@ export default function McpBuilder() {
   const [inputMethod, setInputMethod] = useState<'url' | 'paste' | 'upload'>('url');
   const [pastedContent, setPastedContent] = useState('');
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [maxPages, setMaxPages] = useState(2000);
 
   const validateOpenAIKey = useCallback(async (key: string): Promise<boolean> => {
     if (!key.startsWith('sk-')) {
@@ -1086,7 +1114,7 @@ export default function McpBuilder() {
       console.log(`[McpBuilder] Starting process with method: ${inputMethod}`);
       let result: CrawlResult;
       if (inputMethod === 'url') {
-        result = await processUrlWithLLMCrawl(docUrl, openaiKey, crawlDepth);
+        result = await processUrlWithLLMCrawl(docUrl, openaiKey, crawlDepth, maxPages);
       } else {
         result = await processContent(inputMethod, docUrl, pastedContent, uploadedFile);
       }
@@ -1094,10 +1122,21 @@ export default function McpBuilder() {
       if (result.endpoints.length === 0) {
         console.warn('[McpBuilder] Resultado sem endpoints. Usando fallback de endpoints comuns.');
       }
+      // Attempt auto-deepening if mutating endpoints are missing payloads
+      let attempts = 0;
+      while (result.endpoints.some(e => ['POST', 'PUT', 'PATCH'].includes(e.method) && !(e as any).requestBody) && attempts < 3 && inputMethod === 'url') {
+        attempts++;
+        const deeperDepth = crawlDepth + attempts * 5;
+        const morePages = maxPages * (attempts + 1);
+        console.log(`[McpBuilder] Missing payloads detected. Deepening crawl to depth=${deeperDepth}, maxPages=${morePages}`);
+        const deeper = await processUrlWithLLMCrawl(docUrl, openaiKey, deeperDepth, morePages);
+        result = mergeCrawlResults(result, deeper);
+        setCrawlResult(result);
+      }
       // Ensure mutating endpoints have request body before generating MCP
       const missingBodies = result.endpoints.filter(e => ['POST', 'PUT', 'PATCH'].includes(e.method) && !(e as any).requestBody);
       if (missingBodies.length > 0) {
-        throw new Error(`Foram encontrados ${missingBodies.length} endpoints (POST/PUT/PATCH) sem payload de requisição detectado. Aumente a profundidade ou forneça a spec (swagger/openapi) via URL/Upload/Colar para continuar.`);
+        throw new Error(`Ainda há ${missingBodies.length} endpoints (POST/PUT/PATCH) sem payload detectado. Aumente a profundidade e o limite de páginas, ou forneça a spec (swagger/openapi) via URL/Upload/Colar.`);
       }
       console.log(`[McpBuilder] Process completed successfully! Found ${result.endpoints.length} endpoints`);
       const mcp = await generateMcp(result, openaiKey);
@@ -1247,6 +1286,7 @@ export default function McpBuilder() {
                     disabled={loading}
                   />
                 </div>
+
                 {inputMethod === 'url' && (
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -1264,6 +1304,33 @@ export default function McpBuilder() {
                     <p className="text-xs text-gray-500 mt-1">
                       Caso der erro de CORS, use um dos métodos alternativos abaixo
                     </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Profundidade Máxima</label>
+                        <input
+                          type="number"
+                          min={0}
+                          value={crawlDepth}
+                          onChange={(e) => setCrawlDepth(parseInt(e.target.value || '0', 10))}
+                          className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                          disabled={loading}
+                        />
+                        <p className="text-xs text-gray-500 mt-1">Quanto maior, mais páginas relacionadas serão exploradas</p>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Máx. Páginas</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={maxPages}
+                          onChange={(e) => setMaxPages(parseInt(e.target.value || '1', 10))}
+                          className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                          disabled={loading}
+                        />
+                        <p className="text-xs text-gray-500 mt-1">Limite superior de páginas a processar (alto = extração completa)</p>
+                      </div>
+                    </div>
                   </div>
                 )}
                 {inputMethod === 'paste' && (
