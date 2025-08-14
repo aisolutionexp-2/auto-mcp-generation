@@ -1119,9 +1119,6 @@ export default function McpBuilder() {
         result = await processContent(inputMethod, docUrl, pastedContent, uploadedFile);
       }
       setCrawlResult(result);
-      if (result.endpoints.length === 0) {
-        console.warn('[McpBuilder] Resultado sem endpoints. Usando fallback de endpoints comuns.');
-      }
       // Attempt auto-deepening if mutating endpoints are missing payloads
       let attempts = 0;
       while (result.endpoints.some(e => ['POST', 'PUT', 'PATCH'].includes(e.method) && !(e as any).requestBody) && attempts < 3 && inputMethod === 'url') {
@@ -1132,6 +1129,9 @@ export default function McpBuilder() {
         const deeper = await processUrlWithLLMCrawl(docUrl, openaiKey, deeperDepth, morePages);
         result = mergeCrawlResults(result, deeper);
         setCrawlResult(result);
+      }
+      if (result.endpoints.length === 0) {
+        throw new Error('Não foram encontrados endpoints na documentação. Aumente a Profundidade Máxima e o Máx. Páginas, ou forneça a especificação (swagger/openapi) via URL/Upload/Colar. Verifique também possíveis restrições de CORS.');
       }
       // Ensure mutating endpoints have request body before generating MCP
       const missingBodies = result.endpoints.filter(e => ['POST', 'PUT', 'PATCH'].includes(e.method) && !(e as any).requestBody);
