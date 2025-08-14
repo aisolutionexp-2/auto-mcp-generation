@@ -807,15 +807,12 @@ const processContent = async (method: 'url' | 'paste' | 'upload', url: string, c
     }
   }
   let baseUrl = '';
-  if (method === 'url') {
-    baseUrl = extractBaseUrl(contentToProcess, url);
+  // For paste/upload methods, try to extract base URL from content
+  const baseUrlMatch = contentToProcess.match(/(?:baseUrl|host|server)['":\s]*['"]([^'"]+)['"]/i);
+  if (baseUrlMatch) {
+    baseUrl = baseUrlMatch[1];
   } else {
-    const baseUrlMatch = contentToProcess.match(/(?:baseUrl|host|server)['":\s]*['"]([^'"]+)['"]/i);
-    if (baseUrlMatch) {
-      baseUrl = baseUrlMatch[1];
-    } else {
-      baseUrl = 'https://api.example.com';
-    }
+    baseUrl = 'https://api.example.com';
   }
   console.log(`[McpBuilder] Content processing completed: found ${endpoints.length} endpoints`);
   return {
