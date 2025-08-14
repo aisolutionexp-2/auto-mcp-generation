@@ -171,6 +171,54 @@ const detectAuthType = (html: string): string => {
   return 'bearer';
 };
 
+// Infer a JSON schema from an example object
+const inferJsonSchemaFromExample = (example: any): any => {
+  if (example === null) return { type: 'null' };
+  const type = Array.isArray(example) ? 'array' : typeof example;
+  if (type === 'array') {
+    const firstItem = example.length > 0 ? example[0] : null;
+    return {
+      type: 'array',
+      items: firstItem ? inferJsonSchemaFromExample(firstItem) : {}
+    };
+  }
+  if (type === 'object') {
+    const properties: Record<string, any> = {};
+    const required: string[] = [];
+    Object.keys(example).forEach(key => {
+      required.push(key);
+      properties[key] = inferJsonSchemaFromExample(example[key]);
+    });
+    return { type: 'object', properties, required };
+  }
+  if (type === 'number') return { type: Number.isInteger(example) ? 'integer' : 'number' };
+  if (type === 'boolean') return { type: 'boolean' };
+  return { type: 'string' };
+};
+
+// Try to extract request body JSON from curl text
+const extractRequestBodyFromCurl = (text: string): any | null => {
+  try {
+    const dataRegex = /(?:-d|--data|-\-data-raw|--data-binary)\s+(?:@[^\s]+|(['"])(\{[\s\S]*?\})\1)/i;
+    const match = dataRegex.exec(text);
+    if (match && match[2]) {
+      const jsonString = match[2];
+      try {
+        return JSON.parse(jsonString);
+      } catch {
+        // Try to fix common issues like trailing commas
+        const fixed = jsonString
+          .replace(/,\s*([}\]])/g, '$1')
+          .replace(/\s+/g, ' ');
+        return JSON.parse(fixed);
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
 // Generate curl example for endpoint
 const generateCurlExample = (method: string, path: string, parameters: any[], baseUrl: string): string => {
   try {
@@ -201,6 +249,261 @@ const generateCurlExample = (method: string, path: string, parameters: any[], ba
   } catch (error) {
     console.warn('[McpBuilder] Failed to generate curl example:', error);
     return `curl -H "Authorization: Bearer \${N8N_CREDENTIALS_TOKEN}" "${baseUrl || '\${N8N_BASE_URL}'}${path}"`;
+  }
+};
+
+// Call OpenAI Chat API to assist crawling (best-effort; falls back silently)
+const callOpenAIChat = async (prompt: string, apiKey: string): Promise<string> => {
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You are a helpful assistant that outputs concise JSON only.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0
+      })
+    } as RequestInit);
+    if (!response.ok) throw new Error(`OpenAI HTTP ${response.status}`);
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+    return content;
+  } catch (err) {
+    console.warn('[McpBuilder] OpenAI call failed, continuing without LLM assist:', err);
+    return '';
+  }
+};
+
+// Use LLM to suggest more relevant documentation links on the same origin
+const llmSuggestLinks = async (html: string, baseUrl: string, apiKey: string): Promise<string[]> => {
+  try {
+    const origin = new URL(baseUrl).origin;
+    const prompt = `Given the following documentation HTML (truncated), list up to 15 href links (absolute or relative) that are likely to contain API endpoint definitions, reference pages, or OpenAPI/Swagger specs. Return JSON with a single field \"links\": string[]. Only include links that belong to the same site.\n\nHTML:\n${html.slice(0, 12000)}`;
+    const raw = await callOpenAIChat(prompt, apiKey);
+    const match = raw.match(/\{[\s\S]*\}/);
+    const json = match ? match[0] : raw;
+    const parsed = JSON.parse(json);
+    const links: string[] = Array.isArray(parsed.links) ? parsed.links : [];
+    return links
+      .map(l => {
+        try {
+          if (l.startsWith('http')) return new URL(l).href;
+          return new URL(l, origin).href;
+        } catch { return ''; }
+      })
+      .filter(l => !!l && l.startsWith(origin));
+  } catch {
+    return [];
+  }
+};
+
+// Extract in-page links likely relevant to API docs
+const extractLinksFromHtml = (html: string, baseUrl: string): string[] => {
+  try {
+    const origin = new URL(baseUrl).origin;
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const anchors = Array.from(doc.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+    const keywords = ['api', 'docs', 'swagger', 'openapi', 'reference', 'endpoint', 'v1', 'v2', 'rest', 'graphql'];
+    const links = anchors
+      .map(a => a.getAttribute('href') || '')
+      .filter(href => href && !href.startsWith('#'))
+      .map(href => {
+        try {
+          if (href.startsWith('http')) return new URL(href).href;
+          return new URL(href, baseUrl).href;
+        } catch { return ''; }
+      })
+      .filter(u => !!u && u.startsWith(origin))
+      .filter(u => keywords.some(k => u.toLowerCase().includes(k)))
+      .slice(0, 50);
+    return Array.from(new Set(links));
+  } catch {
+    return [];
+  }
+};
+
+// Fetch a page using multiple strategies
+const fetchPageWithStrategies = async (url: string): Promise<string> => {
+  const strategies = [
+    async () => {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept-Encoding': 'gzip, deflate',
+          'Cache-Control': 'no-cache'
+        },
+        mode: 'cors',
+        credentials: 'omit'
+      } as RequestInit);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.text();
+    },
+    async () => {
+      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+      const response = await fetch(proxyUrl);
+      if (!response.ok) throw new Error(`Proxy failed: ${response.status}`);
+      const data = await response.json();
+      return data.contents;
+    }
+  ];
+  for (const strategy of strategies) {
+    try { const html = await strategy(); if (html && html.length > 50) return html; } catch { continue; }
+  }
+  return '';
+};
+
+// Enhanced HTML documentation parser
+const parseHTMLDocumentation = async (html: string, baseUrl: string): Promise<Endpoint[]> => {
+  const endpoints: Endpoint[] = [];
+  try {
+    console.log('[McpBuilder] Starting comprehensive HTML parsing');
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const textContent = doc.body.textContent || '';
+    const endpointPatterns = [
+      /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\:]+)/gi,
+      /([\/\w\-\{\}\.\:]+)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)/gi,
+      /(\/\/(?:api|v\d+|[a-z_]+)\/[\w\-\/\{\}\.\:]+)/gi,
+      /operationId['":\s]*['"]([^'\"]+)['\"]/gi,
+      /['"`]([\/\w\-\{\}\.\:]+)['"`]/gi,
+      /(?:href|action|url)[=:\s]*['"]([\/\w\-\{\}\.\:]+)['"]/gi
+    ];
+    const foundEndpoints = new Map<string, Set<string>>();
+    const sampleSchemas = new Map<string, any>();
+    for (const pattern of endpointPatterns) {
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(textContent)) !== null) {
+        let path = '';
+        let method = 'GET';
+        if (match[1] && match[2]) {
+          if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(match[1].toUpperCase())) {
+            method = match[1].toUpperCase();
+            path = match[2];
+          } else if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(match[2].toUpperCase())) {
+            path = match[1];
+            method = match[2].toUpperCase();
+          } else {
+            path = match[1];
+          }
+        } else if (match[1]) {
+          path = match[1];
+        }
+        if (path && path.startsWith('/') && path.length > 1 && !path.includes(' ')) {
+          path = path.replace(/['"`;,:\s]+$/, '').replace(/^['"`;,:\s]+/, '');
+          if (!foundEndpoints.has(path)) {
+            foundEndpoints.set(path, new Set());
+          }
+          foundEndpoints.get(path)!.add(method);
+        }
+      }
+    }
+    const tables = doc.querySelectorAll('table');
+    tables.forEach(table => {
+      const rows = table.querySelectorAll('tr');
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('td, th');
+        if (cells.length >= 2) {
+          const cellTexts = Array.from(cells).map(cell => cell.textContent?.trim() || '');
+          for (let i = 0; i < cellTexts.length; i++) {
+            for (let j = 0; j < cellTexts.length; j++) {
+              if (i === j) continue;
+              const text1 = cellTexts[i];
+              const text2 = cellTexts[j];
+              const methodMatch = text1.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/i);
+              const pathMatch = text2.match(/^(\/[\w\-\/\{\}\.\:]*)/);
+              if (methodMatch && pathMatch) {
+                const method = methodMatch[1].toUpperCase();
+                const path = pathMatch[1];
+                if (!foundEndpoints.has(path)) {
+                  foundEndpoints.set(path, new Set());
+                }
+                foundEndpoints.get(path)!.add(method);
+              }
+            }
+          }
+        }
+      });
+    });
+    const codeElements = doc.querySelectorAll('code, pre, .highlight, .code, .example');
+    codeElements.forEach(element => {
+      const text = element.textContent || '';
+      const curlPattern = /curl\s+[^\n]*?(?:-X\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))?[^\n]*?(https?:\/\/[^\s'\"]+|\/[\w\-\/\{\}\.\:]+)/gi;
+      let curlMatch: RegExpExecArray | null;
+      while ((curlMatch = curlPattern.exec(text)) !== null) {
+        const method = curlMatch[1] ? curlMatch[1].toUpperCase() : 'GET';
+        let urlOrPath = curlMatch[2];
+        try {
+          if (urlOrPath.startsWith('http')) {
+            const url = new URL(urlOrPath);
+            urlOrPath = url.pathname;
+          }
+          if (urlOrPath.startsWith('/') && urlOrPath.length > 1) {
+            if (!foundEndpoints.has(urlOrPath)) {
+              foundEndpoints.set(urlOrPath, new Set());
+            }
+            foundEndpoints.get(urlOrPath)!.add(method);
+            // Try to extract request body from the same curl block
+            const body = extractRequestBodyFromCurl(text);
+            if (body) {
+              const key = `${method}:${urlOrPath}`;
+              sampleSchemas.set(key, inferJsonSchemaFromExample(body));
+            }
+          }
+        } catch {
+          // ignore invalid URL
+        }
+      }
+      const httpPattern = /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\:]+)/gi;
+      let httpMatch: RegExpExecArray | null;
+      while ((httpMatch = httpPattern.exec(text)) !== null) {
+        const method = httpMatch[1].toUpperCase();
+        const path = httpMatch[2];
+        if (path.startsWith('/')) {
+          if (!foundEndpoints.has(path)) {
+            foundEndpoints.set(path, new Set());
+          }
+          foundEndpoints.get(path)!.add(method);
+        }
+      }
+    });
+    foundEndpoints.forEach((methods, path) => {
+      methods.forEach(method => {
+        const description = generateDescriptionFromPath(path, method);
+        const tags = extractTagsFromPath(path);
+        const parameters = extractParametersFromPath(path);
+        const key = `${method}:${path}`;
+        const schema = sampleSchemas.get(key);
+        const endpoint: Endpoint = {
+          path,
+          method,
+          operationId: generateOperationId(method, path),
+          description,
+          parameters,
+          tags,
+          requestBody: schema ? { schema } as any : undefined
+        } as Endpoint;
+        endpoints.push(endpoint);
+      });
+    });
+    endpoints.sort((a, b) => {
+      if (a.path !== b.path) return a.path.localeCompare(b.path);
+      return a.method.localeCompare(b.method);
+    });
+    console.log(`[McpBuilder] HTML parsing completed: found ${endpoints.length} endpoints from ${endpoints.length} method-path combos`);
+    return endpoints;
+  } catch (error) {
+    console.error('[McpBuilder] HTML parsing error:', error);
+    return [];
   }
 };
 
@@ -299,141 +602,6 @@ const parseOpenAPISpec = async (content: string, sourceUrl: string): Promise<End
     return endpoints;
   } catch (error) {
     console.error('[McpBuilder] Failed to parse OpenAPI spec:', error);
-    return [];
-  }
-};
-
-// Enhanced HTML documentation parser
-const parseHTMLDocumentation = async (html: string, baseUrl: string): Promise<Endpoint[]> => {
-  const endpoints: Endpoint[] = [];
-  try {
-    console.log('[McpBuilder] Starting comprehensive HTML parsing');
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-    const textContent = doc.body.textContent || '';
-    const endpointPatterns = [
-      /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\:]+)/gi,
-      /([\/\w\-\{\}\.\:]+)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)/gi,
-      /(\/\/(?:api|v\d+|[a-z_]+)\/[\w\-\/\{\}\.\:]+)/gi,
-      /operationId['":\s]*['"]([^'\"]+)['\"]/gi,
-      /['"`]([\/\w\-\{\}\.\:]+)['"`]/gi,
-      /(?:href|action|url)[=:\s]*['"]([\/\w\-\{\}\.\:]+)['"]/gi
-    ];
-    const foundEndpoints = new Map<string, Set<string>>();
-    for (const pattern of endpointPatterns) {
-      let match: RegExpExecArray | null;
-      while ((match = pattern.exec(textContent)) !== null) {
-        let path = '';
-        let method = 'GET';
-        if (match[1] && match[2]) {
-          if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(match[1].toUpperCase())) {
-            method = match[1].toUpperCase();
-            path = match[2];
-          } else if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(match[2].toUpperCase())) {
-            path = match[1];
-            method = match[2].toUpperCase();
-          } else {
-            path = match[1];
-          }
-        } else if (match[1]) {
-          path = match[1];
-        }
-        if (path && path.startsWith('/') && path.length > 1 && !path.includes(' ')) {
-          path = path.replace(/['"`;,:\s]+$/, '').replace(/^['"`;,:\s]+/, '');
-          if (!foundEndpoints.has(path)) {
-            foundEndpoints.set(path, new Set());
-          }
-          foundEndpoints.get(path)!.add(method);
-        }
-      }
-    }
-    const tables = doc.querySelectorAll('table');
-    tables.forEach(table => {
-      const rows = table.querySelectorAll('tr');
-      rows.forEach(row => {
-        const cells = row.querySelectorAll('td, th');
-        if (cells.length >= 2) {
-          const cellTexts = Array.from(cells).map(cell => cell.textContent?.trim() || '');
-          for (let i = 0; i < cellTexts.length; i++) {
-            for (let j = 0; j < cellTexts.length; j++) {
-              if (i === j) continue;
-              const text1 = cellTexts[i];
-              const text2 = cellTexts[j];
-              const methodMatch = text1.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/i);
-              const pathMatch = text2.match(/^(\/[\w\-\/\{\}\.\:]*)/);
-              if (methodMatch && pathMatch) {
-                const method = methodMatch[1].toUpperCase();
-                const path = pathMatch[1];
-                if (!foundEndpoints.has(path)) {
-                  foundEndpoints.set(path, new Set());
-                }
-                foundEndpoints.get(path)!.add(method);
-              }
-            }
-          }
-        }
-      });
-    });
-    const codeElements = doc.querySelectorAll('code, pre, .highlight, .code, .example');
-    codeElements.forEach(element => {
-      const text = element.textContent || '';
-      const curlPattern = /curl\s+[^\n]*?(?:-X\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))?\s+[^\n]*?(https?:\/\/[^\s'\"]+|\/[\w\-\/\{\}\.\:]+)/gi;
-      let curlMatch: RegExpExecArray | null;
-      while ((curlMatch = curlPattern.exec(text)) !== null) {
-        const method = curlMatch[1] ? curlMatch[1].toUpperCase() : 'GET';
-        let urlOrPath = curlMatch[2];
-        try {
-          if (urlOrPath.startsWith('http')) {
-            const url = new URL(urlOrPath);
-            urlOrPath = url.pathname;
-          }
-          if (urlOrPath.startsWith('/') && urlOrPath.length > 1) {
-            if (!foundEndpoints.has(urlOrPath)) {
-              foundEndpoints.set(urlOrPath, new Set());
-            }
-            foundEndpoints.get(urlOrPath)!.add(method);
-          }
-        } catch {
-          // ignore invalid URL
-        }
-      }
-      const httpPattern = /(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([\/\w\-\{\}\.\:]+)/gi;
-      let httpMatch: RegExpExecArray | null;
-      while ((httpMatch = httpPattern.exec(text)) !== null) {
-        const method = httpMatch[1].toUpperCase();
-        const path = httpMatch[2];
-        if (path.startsWith('/')) {
-          if (!foundEndpoints.has(path)) {
-            foundEndpoints.set(path, new Set());
-          }
-          foundEndpoints.get(path)!.add(method);
-        }
-      }
-    });
-    foundEndpoints.forEach((methods, path) => {
-      methods.forEach(method => {
-        const description = generateDescriptionFromPath(path, method);
-        const tags = extractTagsFromPath(path);
-        const parameters = extractParametersFromPath(path);
-        const endpoint: Endpoint = {
-          path,
-          method,
-          operationId: generateOperationId(method, path),
-          description,
-          parameters,
-          tags
-        } as Endpoint;
-        endpoints.push(endpoint);
-      });
-    });
-    endpoints.sort((a, b) => {
-      if (a.path !== b.path) return a.path.localeCompare(b.path);
-      return a.method.localeCompare(b.method);
-    });
-    console.log(`[McpBuilder] HTML parsing completed: found ${endpoints.length} endpoints from ${endpoints.length} method-path combos`);
-    return endpoints;
-  } catch (error) {
-    console.error('[McpBuilder] HTML parsing error:', error);
     return [];
   }
 };
@@ -593,165 +761,91 @@ const extractEndpointsFromGenericJSON = (jsonContent: any): Endpoint[] => {
   return endpoints;
 };
 
-// Real crawler implementation with CORS bypass
-const realCrawl = async (url: string, options: any): Promise<CrawlResult> => {
-  console.log('[McpBuilder] Starting comprehensive crawl for:', url);
+// Crawl documentation across multiple pages using LLM-assisted link discovery
+const crawlDocumentation = async (startUrl: string, apiKey: string, maxDepth: number): Promise<CrawlResult> => {
+  const visited = new Set<string>();
+  const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
+  const endpoints: Endpoint[] = [];
+  const existingKeys = new Set<string>();
+  const sourceUrls: string[] = [];
+  const detectedSpecs: string[] = [];
+  let baseUrl = '';
+  let firstHtml = '';
+
+  while (queue.length > 0) {
+    const { url, depth } = queue.shift()!;
+    if (visited.has(url) || depth > maxDepth) continue;
+    visited.add(url);
+    console.log(`[McpBuilder] Crawling ${url} (depth ${depth})`);
+
+    const html = await fetchPageWithStrategies(url);
+    if (!html) continue;
+    if (!firstHtml) firstHtml = html;
+    sourceUrls.push(url);
+
+    // Try to detect and parse OpenAPI/Swagger specs on this page
+    const specUrls = await findSpecUrls(html, url);
+    for (const specUrl of specUrls) {
+      try {
+        const specHtml = await fetchPageWithStrategies(specUrl);
+        if (specHtml && specHtml.length > 50) {
+          const parsedEndpoints = await parseOpenAPISpec(specHtml, specUrl);
+          for (const ep of parsedEndpoints) {
+            const key = `${ep.method}:${ep.path}`;
+            if (!existingKeys.has(key)) {
+              endpoints.push(ep);
+              existingKeys.add(key);
+            }
+          }
+          detectedSpecs.push('Swagger/OpenAPI Documentation');
+          sourceUrls.push(specUrl);
+        }
+      } catch (err) {
+        console.warn('[McpBuilder] Failed to parse spec at', specUrl, err);
+      }
+    }
+
+    // Parse HTML endpoints
+    const htmlEndpoints = await parseHTMLDocumentation(html, url);
+    for (const ep of htmlEndpoints) {
+      const key = `${ep.method}:${ep.path}`;
+      if (!existingKeys.has(key)) {
+        endpoints.push(ep);
+        existingKeys.add(key);
+      }
+    }
+
+    // Link discovery for further crawl
+    const linkCandidates = extractLinksFromHtml(html, url);
+    let llmLinks: string[] = [];
+    if (apiKey) {
+      try { llmLinks = await llmSuggestLinks(html, url, apiKey); } catch { llmLinks = []; }
+    }
+    const nextLinks = Array.from(new Set([...linkCandidates, ...llmLinks]))
+      .filter(u => !visited.has(u))
+      .slice(0, 20);
+    nextLinks.forEach(u => queue.push({ url: u, depth: depth + 1 }));
+  }
+
+  baseUrl = firstHtml ? extractBaseUrl(firstHtml, startUrl) : new URL(startUrl).origin + '/api';
+  return {
+    endpoints,
+    baseUrl,
+    authType: detectAuthType(firstHtml || ''),
+    sourceUrls: Array.from(new Set(sourceUrls)),
+    detectedSpecs: Array.from(new Set(detectedSpecs.length ? detectedSpecs : ['HTML Documentation Parsing']))
+  };
+};
+
+// Process URL with LLM-assisted crawl
+const processUrlWithLLMCrawl = async (url: string, apiKey: string, maxDepth: number): Promise<CrawlResult> => {
   if (!url.startsWith('https://')) {
     throw new Error('Only HTTPS URLs are allowed');
   }
   if (url.includes('localhost') || url.includes('127.0.0.1')) {
     throw new Error('Local URLs are not allowed for security reasons');
   }
-  const endpoints: Endpoint[] = [];
-  const sourceUrls: string[] = [url];
-  const detectedSpecs: string[] = [];
-  let baseUrl = '';
-  try {
-    let html = '';
-    const fetchStrategies = [
-      {
-        name: 'Direct CORS',
-        fetch: async () => {
-          const response = await fetch(url, {
-            method: 'GET',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5',
-              'Accept-Encoding': 'gzip, deflate',
-              'Cache-Control': 'no-cache'
-            },
-            mode: 'cors',
-            credentials: 'omit'
-          } as RequestInit);
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          return response.text();
-        }
-      },
-      {
-        name: 'AllOrigins Proxy',
-        fetch: async () => {
-          const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-          const response = await fetch(proxyUrl);
-          if (!response.ok) {
-            throw new Error(`Proxy failed: ${response.status}`);
-          }
-          const data = await response.json();
-          return data.contents;
-        }
-      }
-    ];
-    let strategyUsed = 'None';
-    for (const strategy of fetchStrategies) {
-      try {
-        console.log(`[McpBuilder] Trying strategy: ${strategy.name}`);
-        html = await strategy.fetch();
-        if (html && html.length > 50) {
-          console.log(`[McpBuilder] Success with ${strategy.name}, content length:`, html.length);
-          strategyUsed = strategy.name;
-          break;
-        }
-      } catch (error) {
-        console.log(`[McpBuilder] Strategy ${strategy.name} failed:`, error);
-        continue;
-      }
-    }
-    if (!html || html.length < 50) {
-      console.log('[McpBuilder] All fetch strategies failed, generating common API patterns');
-      const commonEndpoints = generateCommonAPIEndpoints(url);
-      if (commonEndpoints.length > 0) {
-        return {
-          endpoints: commonEndpoints,
-          baseUrl: new URL(url).origin,
-          authType: 'bearer',
-          sourceUrls: [url],
-          detectedSpecs: ['Generated Common Patterns']
-        };
-      }
-      throw new Error('Failed to fetch documentation content. The site may block CORS requests. Try using the paste or upload methods instead.');
-    }
-    console.log(`[McpBuilder] Successfully fetched HTML using ${strategyUsed}, length:`, html.length);
-    const isSwaggerUI = html.includes('swagger-ui') || html.includes('SwaggerUIBundle') || html.includes('SwaggerUI');
-    const isRedoc = html.includes('redoc') || html.includes('Redoc.init') || html.includes('RedocStandalone');
-    const isOpenAPI = html.includes('openapi') || html.includes('swagger') || html.includes('spec');
-    console.log('[McpBuilder] Documentation type detection:', { 
-      isSwaggerUI, isRedoc, isOpenAPI 
-    });
-    if (isSwaggerUI || isRedoc || isOpenAPI) {
-      detectedSpecs.push('Swagger/OpenAPI Documentation');
-      const specUrls = await findSpecUrls(html, url);
-      console.log('[McpBuilder] Found potential spec URLs:', specUrls);
-      for (const specUrl of specUrls) {
-        try {
-          let specContent = '';
-          try {
-            const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(specUrl)}`;
-            const response = await fetch(proxyUrl);
-            if (response.ok) {
-              const data = await response.json();
-              specContent = data.contents;
-            }
-          } catch {
-            console.log('[McpBuilder] Proxy fetch failed for spec:', specUrl);
-            continue;
-          }
-          if (specContent && specContent.length > 100) {
-            const parsedEndpoints = await parseOpenAPISpec(specContent, specUrl);
-            if (parsedEndpoints.length > 0) {
-              endpoints.push(...parsedEndpoints);
-              sourceUrls.push(specUrl);
-              console.log('[McpBuilder] Parsed', parsedEndpoints.length, 'endpoints from', specUrl);
-            }
-          }
-        } catch (error) {
-          console.warn('[McpBuilder] Failed to fetch spec from', specUrl, error);
-        }
-      }
-    }
-    console.log('[McpBuilder] Performing comprehensive HTML parsing');
-    detectedSpecs.push('HTML Documentation Parsing');
-    const htmlEndpoints = await parseHTMLDocumentation(html, url);
-    const existingEndpoints = new Set(endpoints.map(e => `${e.method}:${e.path}`));
-    htmlEndpoints.forEach(endpoint => {
-      const key = `${endpoint.method}:${endpoint.path}`;
-      if (!existingEndpoints.has(key)) {
-        endpoints.push(endpoint);
-        existingEndpoints.add(key);
-      }
-    });
-    baseUrl = extractBaseUrl(html, url);
-    console.log('[McpBuilder] Comprehensive crawl completed:', {
-      endpointsFound: endpoints.length,
-      baseUrl,
-      detectedSpecs,
-      strategyUsed,
-      uniqueEndpoints: endpoints.length
-    });
-    if (endpoints.length === 0) {
-      console.warn('[McpBuilder] No endpoints found. Falling back to common API patterns.');
-      const fallbackEndpoints = generateCommonAPIEndpoints(url);
-      detectedSpecs.push('Generated Common Patterns (Fallback)');
-      return {
-        endpoints: fallbackEndpoints,
-        baseUrl,
-        authType: detectAuthType(html),
-        sourceUrls,
-        detectedSpecs
-      };
-    }
-    return {
-      endpoints,
-      baseUrl,
-      authType: detectAuthType(html),
-      sourceUrls,
-      detectedSpecs
-    };
-  } catch (error) {
-    console.error('[McpBuilder] Crawl error:', error);
-    throw new Error(`Failed to crawl documentation: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
+  return await crawlDocumentation(url, apiKey, Math.max(0, Math.min(maxDepth, 4)));
 };
 
 // Process content from different input methods
@@ -990,10 +1084,20 @@ export default function McpBuilder() {
         throw new Error('API Key OpenAI inválida ou sem permissões adequadas');
       }
       console.log(`[McpBuilder] Starting process with method: ${inputMethod}`);
-      const result = await processContent(inputMethod, docUrl, pastedContent, uploadedFile);
+      let result: CrawlResult;
+      if (inputMethod === 'url') {
+        result = await processUrlWithLLMCrawl(docUrl, openaiKey, crawlDepth);
+      } else {
+        result = await processContent(inputMethod, docUrl, pastedContent, uploadedFile);
+      }
       setCrawlResult(result);
       if (result.endpoints.length === 0) {
         console.warn('[McpBuilder] Resultado sem endpoints. Usando fallback de endpoints comuns.');
+      }
+      // Ensure mutating endpoints have request body before generating MCP
+      const missingBodies = result.endpoints.filter(e => ['POST', 'PUT', 'PATCH'].includes(e.method) && !(e as any).requestBody);
+      if (missingBodies.length > 0) {
+        throw new Error(`Foram encontrados ${missingBodies.length} endpoints (POST/PUT/PATCH) sem payload de requisição detectado. Aumente a profundidade ou forneça a spec (swagger/openapi) via URL/Upload/Colar para continuar.`);
       }
       console.log(`[McpBuilder] Process completed successfully! Found ${result.endpoints.length} endpoints`);
       const mcp = await generateMcp(result, openaiKey);
