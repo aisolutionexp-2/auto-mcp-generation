@@ -1430,4 +1430,4 @@ export default function McpBuilder() {
       </div>
     </div>
   );
-}
+};
