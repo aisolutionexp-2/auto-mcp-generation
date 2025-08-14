@@ -882,7 +882,7 @@ const processContent = async (method: 'url' | 'paste' | 'upload', url: string, c
   let sourceUrl = url || 'manual-input';
   switch (method) {
     case 'url':
-      return await processUrlWithLLMCrawl(url, {}, 10, 2000); // Default to a high maxPages for content
+      throw new Error('Modo URL deve ser processado pelo fluxo principal com OpenAI API Key. Utilize handleGenerate em modo URL.')
     case 'paste':
       contentToProcess = content;
       console.log(`[McpBuilder] Processing pasted content, length: ${content.length}`);
